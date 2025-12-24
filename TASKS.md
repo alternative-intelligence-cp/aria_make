@@ -62,7 +62,42 @@ Files: src/init/init.aria, tests/test_init.aria
 
 ## Completed Tasks
 
-*No completed tasks yet.*
+### Task 2: StateManager Implementation (Claude)
+**Completed**: 2025-12-24  
+**Spec**: aria_ecosystem/specs/BUILD_SYSTEM.md, Section 3  
+**Files**: 
+- include/state/artifact_record.hpp
+- include/state/state_manager.hpp
+- src/state/state_manager.cpp
+- tests/test_state_manager.cpp (19/19 tests passing)
+
+**Implementation**:
+- Content-addressable incremental builds
+- Thread-safe operations (std::shared_mutex)
+- FNV-1a + SHA-256 hashing
+- 8 DirtyReason types for comprehensive change detection
+- JSON state persistence
+
+### Task 7: Build Orchestrator + StateManager Integration (Claude)
+**Completed**: 2025-12-24  
+**Spec**: aria_ecosystem/specs/BUILD_SYSTEM.md, Sections 4-6  
+**Files**:
+- include/core/build_orchestrator.hpp (346 lines)
+- src/core/build_orchestrator.cpp (991 lines)
+- src/main.cpp (406 lines)
+- test_project/ (multi-target test case)
+
+**Implementation**:
+- INI-style build.abc parser
+- Dependency graph with topological sort
+- Cycle detection with full path reporting
+- Parallel compilation via thread pool
+- StateManager integration for incremental builds
+- DOT graph export for visualization
+- Progress reporting with build phases
+- 6 CLI commands with comprehensive options
+
+**Status**: Foundation complete, ready for real-world testing
 
 ---
 

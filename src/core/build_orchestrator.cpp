@@ -21,6 +21,8 @@
 #include <condition_variable>
 #include <regex>
 #include <array>
+#include <variant>
+#include <iostream>
 
 namespace aria::make {
 

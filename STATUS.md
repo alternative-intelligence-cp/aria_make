@@ -13,29 +13,32 @@
 - **Thread-Safe Operations** ✅ - Concurrent read/exclusive write
 - **Dependency Tracking** ✅ - File dependency monitoring
 - **State Persistence** ✅ - JSON-based state storage
-
-### Legacy Functionality
-- **Project Structure Generation** - Creates basic Aria project scaffolding
-- **Build Configuration** - Generates build.aria files
+- **Build Orchestrator** ✅ - Complete build pipeline (991 lines)
+  - INI-style build.abc parser
+  - Dependency graph with topological sort
+  - Cycle detection with path reporting
+  - Parallel compilation via thread pool
+  - StateManager integration
+  - DOT graph export
+  - Progress reporting
 
 ### Command-Line Interface
-- **Basic Commands** - `init`, `build`, `clean`
-- **Help System** - `--help` and command documentation
+- **Full CLI** ✅ - 406 lines main.cpp
+  - Commands: `build`, `clean`, `rebuild`, `check`, `targets`, `deps`
+  - Options: `-C`, `-f`, `-j`, `-v`, `--dry-run`, `--force`
+  - Help system with command-specific help
+
+### Test Infrastructure
+- **test_project/** ✅ - Multi-target test case
+  - 3 targets: hello (binary), utils (library), main (binary)
+  - Demonstrates dependency handling
+  - INI-style configuration
 
 ---
 
 ## In Progress 🔄
 
-### Task 7: Integrate depgraph + StateManager (Claude)
-**Status**: Starting implementation  
-**Components**:
-- [ ] Review depgraph implementation
-- [ ] Create build_orchestrator.hpp/cpp
-- [ ] Update aria_make main.cpp entry point
-- [ ] Create test project for aria_make
-- [ ] Test incremental and parallel builds
-
-**Goal**: Wire StateManager into actual build process using dependency graph for parallel builds.
+*No tasks currently in progress.*
 
 ---
 
