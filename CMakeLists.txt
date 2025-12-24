@@ -65,6 +65,39 @@ set_target_properties(aria_make_state PROPERTIES
 )
 
 # -----------------------------------------------------------------------------
+# Library: aria_make_core (Build Orchestrator component)
+# -----------------------------------------------------------------------------
+add_library(aria_make_core STATIC
+    src/core/build_orchestrator.cpp
+)
+
+target_include_directories(aria_make_core
+    PUBLIC
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+        $<INSTALL_INTERFACE:include>
+)
+
+target_link_libraries(aria_make_core PUBLIC aria_make_state Threads::Threads)
+
+set_target_properties(aria_make_core PROPERTIES
+    VERSION ${PROJECT_VERSION}
+    POSITION_INDEPENDENT_CODE ON
+)
+
+# -----------------------------------------------------------------------------
+# Main executable: aria_make
+# -----------------------------------------------------------------------------
+add_executable(aria_make
+    src/main.cpp
+)
+
+target_link_libraries(aria_make PRIVATE aria_make_core)
+
+set_target_properties(aria_make PROPERTIES
+    OUTPUT_NAME "aria_make"
+)
+
+# -----------------------------------------------------------------------------
 # Test executable
 # -----------------------------------------------------------------------------
 option(BUILD_TESTS "Build test executable" ON)
