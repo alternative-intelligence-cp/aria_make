@@ -244,6 +244,25 @@ This work **validates the contribution system pattern** from Aria compiler:
 
 ---
 
+## Claude's Next Target: Task 7 Integration
+
+**Status**: Claude is now working on this (Dec 24, 2024)
+
+**Task**: Integrate depgraph + StateManager into aria_make build orchestration
+
+**Subtasks**:
+1. Review depgraph implementation
+2. Create build_orchestrator.hpp/cpp  
+3. Update aria_make main.cpp entry point
+4. Create test project for aria_make
+5. Test incremental and parallel builds
+
+**Goal**: Wire StateManager into actual build process, enabling real incremental compilation with parallel builds via dependency graph.
+
+**Observation**: Well-defined tasks allow Claude to pick up exactly where he left off, even across session boundaries. The contribution system pattern (clear tasks, acceptance criteria, documentation) works for AI agents too.
+
+---
+
 ## For Next Session
 
 **Status**: ✅ COMPLETE - Ready to commit and integrate

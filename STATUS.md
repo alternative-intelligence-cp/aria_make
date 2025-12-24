@@ -7,10 +7,16 @@
 
 ## What Works ✅
 
-### Core Functionality
+### Core Infrastructure
+- **StateManager** ✅ - Incremental build state tracking (19/19 tests passing)
+- **Content-Addressable Hashing** ✅ - FNV-1a + SHA-256
+- **Thread-Safe Operations** ✅ - Concurrent read/exclusive write
+- **Dependency Tracking** ✅ - File dependency monitoring
+- **State Persistence** ✅ - JSON-based state storage
+
+### Legacy Functionality
 - **Project Structure Generation** - Creates basic Aria project scaffolding
 - **Build Configuration** - Generates build.aria files
-- **Dependency Management** - Tracks project dependencies
 
 ### Command-Line Interface
 - **Basic Commands** - `init`, `build`, `clean`
@@ -20,7 +26,16 @@
 
 ## In Progress 🔄
 
-Currently no active development tasks.
+### Task 7: Integrate depgraph + StateManager (Claude)
+**Status**: Starting implementation  
+**Components**:
+- [ ] Review depgraph implementation
+- [ ] Create build_orchestrator.hpp/cpp
+- [ ] Update aria_make main.cpp entry point
+- [ ] Create test project for aria_make
+- [ ] Test incremental and parallel builds
+
+**Goal**: Wire StateManager into actual build process using dependency graph for parallel builds.
 
 ---
 
