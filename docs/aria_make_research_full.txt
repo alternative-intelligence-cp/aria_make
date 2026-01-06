@@ -1,366 +1,4 @@
-﻿Architectural Specification for AriaBuild: A Deterministic, Declarative Build System for the Aria Language Ecosystem
-1. Introduction: The Imperative for a Modern, Whitespace-Insensitive Build Infrastructure
-The evolution of software engineering has been inextricably linked to the maturation of build systems. From the imperative shell scripts of the early UNIX era to the complex meta-build generators of the modern C++ ecosystem, the mechanism by which source code is transformed into executable artifacts defines the developer experience. For the Aria programming language, currently at version v0.0.7, reliance on legacy tools such as GNU Make presents a significant friction point.1 While Make established the paradigm of dependency-based compilation, its rigid adherence to significant whitespace—specifically the distinction between tabs and spaces—violates the Principle of Least Astonishment and introduces a class of "invisible" syntax errors that hinder productivity.2 Furthermore, the arcane syntax of Makefiles, which blends declarative dependency rules with imperative shell scripting, creates a steep learning curve and reduces maintainability for complex projects.3
-This report articulates the comprehensive design and architectural specification for AriaBuild, a bespoke build automation tool engineered specifically for Aria. The core design philosophy of AriaBuild is "Configuration as Data," rejecting the "Configuration as Code" model that often leads to non-deterministic build states. AriaBuild leverages a JSON-derivative syntax that aligns with Aria’s own object literal definition, ensuring a cohesive syntactic experience for developers.1 This syntax is strictly whitespace-insensitive, utilizing structural delimiters (braces and brackets) to define scope, thereby eliminating the fragility associated with indentation-based logic found in Make, YAML, or Python.4
-By integrating native support for variables and globbing (wildcard pattern matching), AriaBuild addresses the user's specific requirements for a modern, ergonomic tool. Crucially, this system is designed to interface directly with the ariac compiler and the LLVM runtime environment (lli), bridging the gap between high-level project definition and low-level compilation mechanics.1 This document details the syntactic grammar, the graph-theoretic underpinnings of the dependency engine, the implementation of recursive filesystem traversal (globbing), and the integration strategies with the existing Aria compiler frontend.
-2. Syntactic Definition: The Aria Build Configuration (ABC) Language
-The primary interface for any build system is its configuration file. For AriaBuild, we introduce the Aria Build Configuration (ABC) format. This format is designed to be a superset of JSON, retaining its rigorous data structure while relaxing its syntax to improve human readability and writability. The design explicitly rejects significant whitespace, opting instead for C-style block delimiters ({, }) which allow for flexible formatting and robust error recovery during parsing.4
-2.1 Lexical Structure and Deviation from Standard JSON
-Standard JSON (RFC 8259) is an excellent data interchange format but a poor configuration language due to its lack of comments and strict quoting rules.6 The ABC format addresses these deficiencies by adopting the specific object literal syntax used within the Aria language itself, creating a seamless mental model for developers.
-2.1.1 Structural Delimiters and Whitespace Independence
-In direct response to the requirement for non-whitespace sensitivity, ABC treats all whitespace (spaces, tabs, line feeds, carriage returns) purely as token separators. The structure of the build definition is determined solely by:
-* Braces {}: Denoting objects (scopes, targets, settings).
-* Brackets ``: Denoting ordered lists (source files, flags).
-* Colons :: Separating keys from values.
-* Commas ,: Separating elements in lists or objects (with support for trailing commas).
-This design allows the build file to be minified onto a single line or expanded with elaborate indentation without altering its semantic meaning, fundamentally resolving the "tab vs. space" conflict inherent in Makefiles.8
-2.1.2 Support for Comments
-A critical deficiency in standard JSON is the absence of comments. Build files serve as documentation for the build process, necessitating the ability to annotate complex configurations. AriaBuild adopts the Aria language's comment syntax:
-* Single-line comments: Initiated by // and continuing to the end of the line.1
-* Usage: These are legal anywhere whitespace is allowed, enabling developers to document specific flags or temporary exclusions directly alongside the configuration data.
-2.1.3 Identifier Syntax
-To reduce visual clutter (often referred to as "syntax noise"), ABC allows keys in key-value pairs to be unquoted if they constitute valid identifiers. Borrowing from the Aria lexer definitions (src/frontend/lexer/token.cpp), a valid identifier consists of alphanumeric characters and underscores, and must not start with a digit.1
-* Standard JSON: "source_dir": "src"
-* ABC Syntax: source_dir: "src"
-This minor syntactic sugar significantly improves readability, making the configuration look more like a native Aria struct declaration than a serialized data packet.1
-2.2 The Configuration Schema
-The build configuration is a hierarchical object model defined in a file typically named build.aria or aria.json. This file structure is validated against a schema to ensure type safety before the build process begins. The schema is divided into three primary sections: project, variables, and targets.
-Section
-	Type
-	Description
-	project
-	Object
-	Metadata regarding the project name, version, and Aria compatibility.
-	variables
-	Object
-	A dictionary of key-value pairs defining reusable string constants (e.g., paths, flags).
-	targets
-	List
-	An array of build target objects, each defining a discrete output artifact (executable, library).
-	2.2.1 The Variables Section
-The variables section serves as a symbol table for the build configuration. It allows users to define constants that can be interpolated into strings elsewhere in the file. This prevents magic strings and allows for centralized configuration management.10
-Example Variable Declaration:
-
-
-Code snippet
-
-
-
-
-variables: {
-   // Standard directories
-   src: "src",
-   bin: "dist/bin",
-   
-   // Compiler settings
-   optimization: "-O3",
-   include_path: "lib/std"
-}
-
-2.2.2 The Targets Section
-The targets section is the core of the declarative specification. Each object in this list represents a node in the dependency graph. Unlike Make, which conflates file dependencies with shell commands, AriaBuild separates the intent (what to build) from the mechanism (how to build it).
-Target Schema Fields:
-* name: Unique identifier for the target.
-* type: Enumeration (binary, library, script, test).
-* sources: List of strings, supporting glob patterns.
-* depends_on: List of strings referencing other target names.
-* output: Destination path for the compiled artifact (.ll file).
-* flags: List of compiler flags passed to ariac.
-2.3 Variable Substitution and String Interpolation
-AriaBuild implements a robust variable substitution engine using the specific syntax found in Aria template literals: backticks and the &{} marker.1 This design decision reinforces language consistency; the syntax used to interpolate strings in the build file is identical to the syntax used in the runtime source code.
-2.3.1 Syntax and Resolution Logic
-When the parser encounters a string token, it scans for the &{...} pattern. If found, the enclosed identifier is extracted and resolved against the current scope's symbol table.
-* Resolution Order:
-   1. Local Scope: Variables defined within the current target.
-   2. Global Scope: Variables defined in the root variables block.
-   3. Environment Scope: Variables prefixed with ENV. (e.g., &{ENV.HOME}), allowing the build to adapt to the host operating system.12
-Interpolation Example:
-
-
-Code snippet
-
-
-
-
-// Definition
-variables: {
-   out_dir: "build"
-}
-
-// Usage
-targets:
-
-This mechanisms allows for dynamic path construction without the overhead of a Turing-complete scripting language, maintaining the declarative nature of the system while providing necessary flexibility.14
-________________
-3. The Globbing Subsystem: Recursive Pattern Matching
-One of the critical requirements for AriaBuild is the support for globs—wildcard patterns that expand to a list of files. This feature allows developers to include entire directory trees (e.g., src/**/*.aria) without manually listing every source file, a feature that CMake notoriously lacked for years due to caching concerns.15
-3.1 The Need for a Custom Implementation
-A thorough analysis of the Aria runtime (src/runtime/io/ and stdlib/io.aria) reveals a significant capability gap: the current runtime supports basic file operations (readFile, fileExists) but explicitly lacks directory iteration or globbing functions.1 The standard library has no readdir, glob, or walk functions.
-Consequently, AriaBuild cannot rely on the Aria standard library to perform file discovery. Instead, the globbing subsystem must be implemented in the host language (C++) of the build tool itself, utilizing the C++17 std::filesystem library for directory traversal and regex/fnmatch for pattern matching.17
-3.2 Globbing Syntax Specifications
-AriaBuild supports the de facto standard globbing syntax used by shells (bash/zsh) and modern editors (VS Code).19
-* * (Asterisk): Matches any sequence of characters within a single path segment. It does not cross directory boundaries (separators).
-   * Example: src/*.aria matches src/main.aria but not src/utils/helper.aria.
-* ** (Double Asterisk): The recursive wildcard. Matches any sequence of characters, including directory separators.
-   * Example: src/**/*.aria matches src/main.aria, src/utils/helper.aria, and src/libs/math/vector.aria.
-* ? (Question Mark): Matches exactly one character.
-   * Example: test_?.aria matches test_1.aria but not test_10.aria.
-* [...] (Character Class): Matches any single character enclosed in the brackets.
-   * Example: file[0-9].aria.
-3.3 The Recursive Traversal Algorithm
-To implement ** efficiently without native OS support in the Aria runtime, AriaBuild utilizes std::filesystem::recursive_directory_iterator.21 The algorithm proceeds as follows:
-1. Pattern Parsing: The glob pattern string is decomposed into segments. A pattern like src/**/*.aria is split into a fixed root (src), a recursive directive (**), and a suffix matcher (*.aria).
-2. Root Anchoring: The search begins at the first non-wildcard segment. If the pattern is src/**/*.aria, the traversal is anchored at ./src.
-3. Recursive Iteration: The engine instantiates a recursive_directory_iterator at the anchor path.
-4. Filtering: For every entry visited:
-   * If it is a directory, the iterator descends (unless excluded).
-   * If it is a regular file, its relative path is matched against the remaining pattern using std::regex or a custom fnmatch implementation designed for path delimiters.18
-5. Exclusion: The system checks specific exclusion patterns (e.g., tests/**) defined in the target configuration and prunes the traversal accordingly.
-3.4 Caching and Determinism
-Globbing introduces non-determinism if files are added or removed without updating the configuration file. To mitigate this—a common critique in build system design 23—AriaBuild creates a snapshot of the glob expansion logic.
-* Manifest Generation: During the build initialization, all globs are expanded into a concrete list of files.
-* Cache Invalidation: This list is hashed and stored. On subsequent runs, if the glob pattern has not changed, the build tool can optionally use the cached file list (fast mode) or re-scan the filesystem (safe mode) to detect new files.
-* Sorting: To ensure deterministic builds (where the order of linking matters), the results of any glob expansion are strictly sorted alphabetically before being passed to the compiler. This prevents issues where the OS returns directory entries in an arbitrary order.23
-________________
-4. Dependency Graph Engine: Theory and Implementation
-The core logic of AriaBuild revolves around the construction and resolution of a Dependency Graph. This graph models the relationships between source files, build targets, and external modules, ensuring that artifacts are built in the mathematically correct order.
-4.1 Directed Acyclic Graph (DAG) Structure
-The build process is modeled as a DAG where:
-* Nodes ($V$) represent entities: Source files (.aria), Intermediate artifacts (.ll), and Targets (Executables/Libraries).
-* Edges ($E$) represent dependencies: An edge $A \to B$ implies "A depends on B," meaning B must be built before A.24
-For Aria, dependencies arise from two sources:
-1. Explicit Target Dependencies: Defined in the configuration file via depends_on. For example, the main target depends on the math_lib target.
-2. Implicit Source Dependencies: Derived by parsing source code. The Aria use statement (e.g., use std.io;) creates an implicit dependency between the consumer file and the module file.1
-4.2 Topological Sorting for Execution Scheduling
-To derive a linear execution schedule from the DAG, AriaBuild employs Topological Sorting. A topological sort of a DAG is a linear ordering of its vertices such that for every directed edge $uv$, vertex $u$ comes before vertex $v$ in the ordering.25
-4.2.1 Kahn’s Algorithm Implementation
-AriaBuild uses Kahn’s Algorithm for sorting due to its iterative nature and ability to easily detect cycles:
-1. Initialization: Calculate the in-degree (number of incoming dependency edges) for all nodes.
-2. Queue Population: Enqueue all nodes with an in-degree of 0 (independent tasks).
-3. Processing:
-   * Dequeue a node $N$ and add it to the BuildQueue.
-   * For each neighbor $M$ dependent on $N$, decrement $M$'s in-degree.
-   * If $M$'s in-degree becomes 0, enqueue $M$.
-4. Completion: If the BuildQueue size equals the total number of nodes, the sort is valid.
-4.2.2 Cycle Detection and Reporting
-If the queue becomes empty but nodes remain with non-zero in-degrees, a circular dependency exists (e.g., A depends on B, B depends on A). Unlike simpler tools that might hang or crash, AriaBuild detects this state. It performs a Depth First Search (DFS) on the remaining nodes to identify the specific cycle path (e.g., module A -> module B -> module A) and reports a descriptive error to the user, a critical feature for debugging complex module interactions.27
-4.3 Incremental Build Logic
-To optimize performance, AriaBuild avoids rebuilding targets that remain up-to-date. This is achieved through timestamp comparison, a technique prevalent in Make but refined here.
-* Logic: For a target $T$ with source inputs $S_1, S_2... S_n$:
-   1. Retrieve the last modification time $M(T)$ of the output artifact.
-   2. Retrieve the last modification times $M(S_i)$ for all inputs.
-   3. If $M(T)$ does not exist, or if $\max(M(S_i)) > M(T)$, the target is dirty and requires rebuilding.28
-* Aria Specifics: Since aria_file_size and aria_file_exists are the only metadata functions exposed in the standard library 1, the build tool itself must use C++ system calls (stat or std::filesystem::last_write_time) to perform these checks. This is a crucial architectural distinction: the build tool has capabilities the runtime currently lacks.1
-________________
-5. Toolchain Orchestration and Runtime Integration
-AriaBuild acts as a meta-driver for the existing Aria toolchain. It does not compile code directly but orchestrates the invocation of ariac and lli based on the resolved dependency graph.
-5.1 Invoking the ariac Compiler
-The Aria compiler (ariac) provides specific flags that the build system must utilize to function correctly 1:
-* Output Direction (-o): The build system explicitly maps the target's output variable to this flag.
-   * Command: ./ariac src/main.aria -o build/main.ll
-* Include Path Management (-I): Dependencies defined in the depends_on list are converted into include paths. If Target A depends on Target B (located in lib/B), the build system constructs the command with -I lib/B.
-* Preprocessing Debugging (-E): AriaBuild supports a --debug-macro mode. When enabled, it invokes ariac with the -E flag to generate preprocessed.aria. This allows developers to inspect macro expansions (like GEN_MAX or GEN_ABS from the guide 1) without compilation errors halting the process.
-5.2 Execution via LLVM Interpreter
-For targets of type binary, AriaBuild does not produce a native executable directly (as Aria currently compiles to LLVM IR). Instead, it acts as a wrapper for the lli tool.
-* Execution Flow:
-   1. AriaBuild ensures program.ll is up-to-date.
-   2. It constructs the command: lli build/program.ll.
-   3. It streams stdout and stderr from the child process to the user's console, handling standard file descriptors correctly via the platform abstraction layer.1
-5.3 LSP and IDE Support (compile_commands.json)
-To support the Aria Language Server (aria-ls), AriaBuild acts as the source of truth for project structure. It generates a compile_commands.json file in the build root. This JSON file is the standard for C/C++ tooling (and by extension Aria) to describe how each file is processed.29
-Format Example:
-
-
-JSON
-
-
-
-
-[
- {
-   "directory": "/home/user/project",
-   "command": "./ariac src/main.aria -I lib -o build/main.ll",
-   "file": "src/main.aria"
- }
-]
-
-The Aria LSP, which uses nlohmann/json for parsing, reads this file to understand include paths (-I), enabling features like "Go to Definition" for imported modules.1
-________________
-6. Implementation Specifications: Internal Data Structures
-The implementation of AriaBuild relies on a set of C++ structures designed to mirror the ABC configuration schema while supporting the runtime logic of the dependency graph.
-6.1 The Object Model
-The parser populates a BuildContext structure that holds the global state of the build.
-
-
-C++
-
-
-
-
-struct BuildContext {
-   // Symbol table for variable resolution
-   std::map<std::string, std::string> variables;
-   
-   // The dependency graph nodes
-   std::map<std::string, Target> targets;
-   
-   // Global settings
-   CompilerSettings settings;
-};
-
-struct Target {
-   std::string name;
-   TargetType type; // BINARY, LIBRARY, etc.
-   
-   // Expanded file lists (post-globbing)
-   std::vector<std::filesystem::path> source_files;
-   
-   // Dependency edges
-   std::vector<std::string> dependency_names;
-   
-   // Status flags
-   bool is_dirty;
-   bool visited; // For cycle detection
-   bool on_stack; // For cycle detection
-};
-
-6.2 Lexer Reuse Strategy
-To maintain strict compatibility with Aria source code, AriaBuild links against the aria_frontend library to reuse the Lexer class.1 This ensures that string literals (including backtick strings &{...}) and comments (//) are tokenized exactly as they are in the compiler.
-* Token Mapping:
-   * TOKEN_LEFT_BRACE ({): Starts an object.
-   * TOKEN_IDENTIFIER: Used for keys (src_dir) and variable names.
-   * TOKEN_STRING: Used for values ("src").
-   * TOKEN_TEMPLATE_START (`): Used for strings containing variables.
-6.3 Parallel Execution Scheduler
-Once the graph is sorted, AriaBuild utilizes a thread pool to execute tasks. The scheduler monitors the dependency graph:
-1. Identify all targets with in-degree == 0 (no unbuilt dependencies).
-2. Assign these targets to worker threads (up to std::thread::hardware_concurrency()).
-3. Upon target completion, update the graph by removing edges originating from the completed target.
-4. Repeat until the graph is empty.
-This parallelism is crucial for scaling build times on large multi-module Aria projects.23
-________________
-7. Comparative Analysis: AriaBuild vs. Existing Solutions
-Feature
-	GNU Make
-	CMake
-	Ninja
-	AriaBuild
-	Configuration Syntax
-	Makefile (Tab-sensitive)
-	CMakeLists.txt (Custom Lang)
-	Ninja (Machine Code)
-	ABC (JSON-like)
-	Whitespace Sensitivity
-	High (Fatal errors)
-	Low
-	Low
-	None (Delimiters)
-	Variable Syntax
-	$(VAR)
-	${VAR}
-	$var
-	&{VAR} (Aria native)
-	Globbing Support
-	wildcard function
-	Discouraged (CACHE issues)
-	No native globbing
-	Native Recursive
-	Dependency Resolution
-	Timestamp only
-	Timestamp / Hash
-	Timestamp
-	Timestamp + Module Import
-	Comments
-	#
-	#
-	#
-	// (Aria native)
-	Tooling Integration
-	Weak
-	Strong
-	Strong
-	Native (compile_commands)
-	Summary of Advantages:
-1. Ergonomics: By removing whitespace sensitivity and adopting JSON-like scoping, AriaBuild eliminates the most common frustration of Makefiles (tab errors).
-2. Consistency: Using &{var} and // aligns the build system with the language it builds, reducing context switching for developers.
-3. Modernity: Native support for recursive globs (**) removes the need for calling external shell commands like find, making builds portable across Windows and Linux.18
-________________
-8. Conclusion and Future Roadmap
-AriaBuild addresses the immediate need for a robust, developer-friendly build system within the Aria ecosystem. By discarding the legacy baggage of whitespace-sensitive parsing and adopting a declarative, JSON-based approach, it provides a stable foundation for project management. The architectural decision to implement globbing and timestamp analysis in the C++ host tool—bypassing the current limitations of the Aria runtime—ensures that the system is both performant and feature-complete immediately.
-8.1 Recommendations for Implementation
-1. Immediate: Implement the ConfigParser by extending aria::frontend::Parser to handle the ABC grammar.
-2. Short Term: Integrate std::filesystem to provide the globbing logic currently missing from stdlib/io.aria.
-3. Long Term: As the Aria runtime matures, expose the stat and directory iteration APIs to the standard library, allowing AriaBuild to eventually be self-hosted (written in Aria itself).
-8.2 Final Specification Snippet
-Below is the definitive reference for a valid build.aria file under this architecture:
-
-
-Code snippet
-
-
-
-
-// aria-build-config v1
-{
-   project: {
-       name: "MyAriaApp",
-       version: "0.1.0"
-   },
-
-   variables: {
-       // Global path definitions
-       src: "src",
-       libs: "vendor"
-   },
-
-   targets:
-       },
-       {
-           name: "main_app",
-           type: "binary",
-           sources: ["&{src}/*.aria"],
-           // Explicit dependency management
-           depends_on: ["core_lib"],
-           // Output mapped to -o flag
-           output: "bin/app.ll"
-       }
-   ]
-}
-
-This specification delivers a build system that is not only "better than Make" but uniquely adapted to the syntax, structure, and capabilities of the Aria programming language.
-Works cited
-1. ARIA_PROGRAMMING_GUIDE.txt
-2. For what reasons do some programmers vehemently hate languages where whitespace matters (eg Python)? [closed] - Stack Overflow, accessed December 19, 2025, https://stackoverflow.com/questions/2695286/for-what-reasons-do-some-programmers-vehemently-hate-languages-where-whitespace
-3. Taskfile: A Modern Alternative to Makefile | Hacker News, accessed December 19, 2025, https://news.ycombinator.com/item?id=36744450
-4. Builtin support for white space sensitive languages · Issue #219 · tree-sitter/tree-sitter - GitHub, accessed December 19, 2025, https://github.com/tree-sitter/tree-sitter/issues/219
-5. Ideas for a language that has no clutter : r/ProgrammingLanguages - Reddit, accessed December 19, 2025, https://www.reddit.com/r/ProgrammingLanguages/comments/1es6s3k/ideas_for_a_language_that_has_no_clutter/
-6. What is JSONC, what is JSON5. - Paji's Blog, accessed December 19, 2025, https://paji.blog/jsonc-json5
-7. JSON - Wikipedia, accessed December 19, 2025, https://en.wikipedia.org/wiki/JSON
-8. Why do we still have programming languages that rely on indentation / white space?, accessed December 19, 2025, https://softwareengineering.stackexchange.com/questions/391159/why-do-we-still-have-programming-languages-that-rely-on-indentation-white-spac
-9. JSON5 – JSON for Humans - Hacker News, accessed December 19, 2025, https://news.ycombinator.com/item?id=42360681
-10. How content designers can (and should) use JSON files - UX Content Collective, accessed December 19, 2025, https://uxcontent.com/content-design-json/
-11. Set globa Variables From JSON Variables - Stack Overflow, accessed December 19, 2025, https://stackoverflow.com/questions/28883097/set-globa-variables-from-json-variables
-12. Variables reference - Visual Studio Code, accessed December 19, 2025, https://code.visualstudio.com/docs/reference/variables-reference
-13. Configuration in ASP.NET Core - Microsoft Learn, accessed December 19, 2025, https://learn.microsoft.com/en-us/aspnet/core/fundamentals/configuration/?view=aspnetcore-10.0
-14. Variable syntax | Grafana documentation, accessed December 19, 2025, https://grafana.com/docs/grafana/latest/visualizations/dashboards/variables/variable-syntax/
-15. Proper file globbing in cmake with make and ninja - Stack Overflow, accessed December 19, 2025, https://stackoverflow.com/questions/48064402/proper-file-globbing-in-cmake-with-make-and-ninja
-16. Problems with Globbing in Build Systems - Embedded Artistry, accessed December 19, 2025, https://embeddedartistry.com/fieldatlas/problems-with-globbing-in-build-systems/
-17. File globbing in the standard library - Google Groups, accessed December 19, 2025, https://groups.google.com/a/isocpp.org/g/std-proposals/c/3iWOM56dSl4
-18. glob (programming) - Wikipedia, accessed December 19, 2025, https://en.wikipedia.org/wiki/Glob_(programming)
-19. Working with glob patterns in syntax - AWS CodePipeline, accessed December 19, 2025, https://docs.aws.amazon.com/codepipeline/latest/userguide/syntax-glob.html
-20. Glob Patterns Reference - Visual Studio Code, accessed December 19, 2025, https://code.visualstudio.com/docs/editor/glob-patterns
-21. std::filesystem::recursive_directory_iterator - cppreference.com - C++ Reference, accessed December 19, 2025, https://en.cppreference.com/w/cpp/filesystem/recursive_directory_iterator.html
-22. Simple glob in C++ on unix system? - Stack Overflow, accessed December 19, 2025, https://stackoverflow.com/questions/8401777/simple-glob-in-c-on-unix-system
-23. Learning Build Systems: Premake Wildcards vs CMake Globbing : r/cpp - Reddit, accessed December 19, 2025, https://www.reddit.com/r/cpp/comments/u8vrpt/learning_build_systems_premake_wildcards_vs_cmake/
-24. Introduction to the dependency graph - Tweag, accessed December 19, 2025, https://tweag.io/blog/2025-09-04-introduction-to-dependency-graph/
-25. Topological Sorting Explained: A Step-by-Step Guide for Dependency Resolution - Medium, accessed December 19, 2025, https://medium.com/@amit.anjani89/topological-sorting-explained-a-step-by-step-guide-for-dependency-resolution-1a6af382b065
-26. Topological sorting - Wikipedia, accessed December 19, 2025, https://en.wikipedia.org/wiki/Topological_sorting
-27. How to implement and resolve circular dependencies in a programming language with modules? : r/ProgrammingLanguages - Reddit, accessed December 19, 2025, https://www.reddit.com/r/ProgrammingLanguages/comments/sulsmb/how_to_implement_and_resolve_circular/
-28. Build System Rules and Algorithms - Embedded Artistry, accessed December 19, 2025, https://embeddedartistry.com/blog/2017/04/17/build-system-rules-and-algorithms/
-29. JSON Compilation Database Format Specification — Clang 22.0.0git documentation - LLVM, accessed December 19, 2025, https://clang.llvm.org/docs/JSONCompilationDatabase.html
-30. json config with glob pattern and editor variables support #650 - GitHub, accessed December 19, 2025, https://github.com/clangd/vscode-clangd/issues/650
-31. An overview of build systems (mostly for C++ projects) : r/cpp - Reddit, accessed December 19, 2025, https://www.reddit.com/r/cpp/comments/8zm66h/an_overview_of_build_systems_mostly_for_c_projects/
-32. Glob files *without* using a shell - Unix & Linux Stack Exchange, accessed December 19, 2025, https://unix.stackexchange.com/questions/605843/glob-files-without-using-a-shell/* types
+/* types
 int1,
 int2,
 int4,
@@ -382,6 +20,27 @@ tbb8,  !!! IMPORTANT tbb8 is Twisted Balanced Binary 8-bit: symmetric range [-12
 tbb16, !!! IMPORTANT tbb16 is Twisted Balanced Binary 16-bit: symmetric range [-32767, +32767], -32768 (0x8000) is ERR sentinel NOT NEGOTIABLE!!!
 tbb32, !!! IMPORTANT tbb32 is Twisted Balanced Binary 32-bit: symmetric range [-2147483647, +2147483647], min value is ERR sentinel NOT NEGOTIABLE!!!
 tbb64, !!! IMPORTANT tbb64 is Twisted Balanced Binary 64-bit: symmetric range, min value is ERR sentinel, sticky error propagation NOT NEGOTIABLE!!!
+frac8,  !!! IMPORTANT frac8 is mixed-fraction rational number: struct {tbb8:whole; tbb8:num; tbb8:denom;}, exact rational arithmetic NOT NEGOTIABLE!!!
+frac16, !!! IMPORTANT frac16 is mixed-fraction rational number: struct {tbb16:whole; tbb16:num; tbb16:denom;}, exact rational arithmetic NOT NEGOTIABLE!!!
+frac32, !!! IMPORTANT frac32 is mixed-fraction rational number: struct {tbb32:whole; tbb32:num; tbb32:denom;}, exact rational arithmetic NOT NEGOTIABLE!!!
+frac64, !!! IMPORTANT frac64 is mixed-fraction rational number: struct {tbb64:whole; tbb64:num; tbb64:denom;}, exact rational arithmetic, sticky ERR propagation NOT NEGOTIABLE!!!
+tfp32,  !!! IMPORTANT tfp32 is Twisted Floating Point 32-bit: tbb16 exponent + tbb16 mantissa, deterministic, no -0, unified ERR NOT NEGOTIABLE!!!
+tfp64,  !!! IMPORTANT tfp64 is Twisted Floating Point 64-bit: tbb16 exponent + tbb48 mantissa, deterministic, no -0, unified ERR, cross-platform bit-exact NOT NEGOTIABLE!!!
+
+!!! ARIA-018: SENTINEL DISCONTINUITY CONSTRAINT - CRITICAL SAFETY RULE !!!
+!!! IMPLICIT TBB WIDENING IS FORBIDDEN !!!
+!!! Reason: Each TBB width has different sentinel value (tbb8:-128, tbb16:-32768, tbb32/64:MIN_INT)
+!!! Problem: Standard sign-extension DOES NOT preserve ERR state during widening
+!!! Example:
+!!!   tbb8:err = ERR;           // 0x80 = -128 (ERR sentinel in tbb8)
+!!!   tbb16:wide = err;          // FORBIDDEN! Would become 0xFF80 = -128 (VALID in tbb16, NOT ERR!)
+!!!   // ERR "healed" into valid number! Sensor failure becomes valid -128°C reading!
+!!! Solution: Use explicit tbb_widen<T>() intrinsic which preserves sentinels:
+!!!   tbb16:wide = tbb_widen<tbb16>(err);  // ✓ Correctly maps ERR to tbb16 ERR (-32768)
+!!! Implementation: Branchless cmov/csel instruction, zero performance overhead
+!!! See: docs/specs/TBB_TYPE_SYSTEM_SPEC.md Section 6.5 for full details
+!!! Status: Enforced by type checker, compile-time error if violated
+
 flt32,
 flt64,
 flt128,
@@ -699,6 +358,231 @@ tbb8:absolute = abs(val) ? ERR;      // 127 (always safe, no overflow)
 tbb16:medium = 30000;          // Range: [-32767, +32767], ERR = -32768
 tbb32:large = 2000000000;      // Range: [-2147483647, +2147483647]
 tbb64:huge = 9000000000000;    // 64-bit symmetric range
+
+// FRACTION TYPES (frac) - EXACT RATIONAL ARITHMETIC
+// Fraction types provide mathematically exact representation of rational numbers
+// Built on TBB types, inheriting sticky error propagation and safety guarantees
+// CRITICAL: No floating-point drift, no rounding errors, perfect determinism
+
+// FRACTION STRUCTURE - MIXED NUMBER REPRESENTATION
+// frac = Whole + Numerator/Denominator
+// struct:frac<N> = { tbb<N>:whole; tbb<N>:num; tbb<N>:denom; }
+// Value = whole + (num / denom)
+// Example: 3 1/2 is stored as {whole: 3, num: 1, denom: 2}
+
+frac8:small_ratio = {0, 1, 3};      // 1/3 (exact, not 0.333...)
+frac16:precise = {2, 1, 4};         // 2 1/4 = 2.25 (exact)
+frac32:phase = {0, 1, 7};           // 1/7 phase offset (exact harmonic)
+frac64:high_precision = {5, 2, 3};  // 5 2/3 (mathematically exact)
+
+// FRACTION CANONICAL FORM - STRICT INVARIANTS
+// All frac values maintain these invariants (enforced by normalize()):
+// 1. Denominator always positive (denom > 0)
+// 2. Numerator non-negative when whole ≠ 0 (num ≥ 0)
+// 3. Proper fraction (num < denom)
+// 4. Reduced to lowest terms (gcd(num, denom) = 1)
+// 5. Sign handling:
+//    - If whole ≠ 0: Sign lives in whole, num stays positive
+//    - If whole = 0: Sign lives in num (handles -1 < value < 0)
+
+// FRACTION SIGN REPRESENTATION (Strictly Additive Model)
+frac64:positive = {0, 3, 4};        // +3/4
+frac64:negative = {0, -3, 4};       // -3/4 (sign in num when whole=0)
+frac64:pos_mixed = {2, 1, 3};       // 2 + 1/3 = 7/3
+frac64:neg_mixed = {-2, 1, 3};      // -2 + 1/3 = -5/3 (sign in whole)
+frac64:edge_case = {0, -1, 2};      // -1/2 (avoids -0 problem)
+
+// FRACTION ARITHMETIC - EXACT OPERATIONS
+// All operations use GCD reduction and maintain canonical form
+// Overflow in intermediate calculations → ERR (sticky propagation)
+// Division by zero → ERR
+// Denominator overflow → ERR
+
+frac64:a = {1, 1, 3};               // 1 1/3
+frac64:b = {0, 1, 6};               // 1/6
+frac64:sum = a + b;                 // 1 1/2 (exact: 4/3 + 1/6 = 9/6 = 3/2)
+frac64:product = a * b;             // 2/9 (exact: 4/3 × 1/6 = 4/18 = 2/9)
+frac64:quotient = a / b;            // 8 (exact: (4/3) / (1/6) = 8/1)
+
+// FRACTION LITERAL SYNTAX
+// Primary: Struct initialization (explicit, unambiguous)
+frac64:val1 = {1, 1, 2};            // Explicit: {whole, num, denom}
+
+// Secondary: Compile-time constant expression (readable)
+frac64:val2 = 1 + 1/2;              // Parsed as frac addition at compile time
+
+// FRACTION ERROR STATES (Sticky ERR Propagation)
+// frac is ERR if any component is TBB ERR, or if denom = 0
+frac64:zero_denom = {1, 1, 0};      // ERR (division by zero)
+frac64:overflow = {ERR, 0, 1};      // ERR (whole is ERR)
+frac64:err_result = zero_denom + {1, 0, 1};  // ERR (sticky propagation)
+
+// FRACTION VS FLOAT - WHY EXACT RATIONALS MATTER
+// JavaScript problem (floating-point drift):
+//   0.1 + 0.2 = 0.30000000000000004  (WRONG!)
+//   1/3 stored as 0.333333... (approximation)
+//   (1/3) * 3 = 0.999999... ≈ 1 (needs epsilon comparison hacks)
+
+// Aria solution (exact arithmetic):
+frac64:third = {0, 1, 3};           // ACTUALLY 1/3, not approximation
+frac64:result = third + third + third;  // EXACTLY {1, 0, 1} = 1
+frac64:tenth = {0, 1, 10};          // EXACTLY 1/10
+frac64:fifth = {0, 1, 5};           // EXACTLY 1/5  
+frac64:exact_sum = tenth + fifth + fifth;  // EXACTLY 1/2 = {0, 1, 2}
+
+// FRACTION USE CASES - WHERE EXACTNESS IS CRITICAL
+// 1. Physics simulations - wave interference, phase offsets (no drift)
+// 2. Financial calculations - compound interest, splits (no rounding errors)
+// 3. Music theory - frequency ratios, harmonics (exact intervals)
+// 4. Recipe scaling - 1/3 cup × 3 = exactly 1 cup (no accumulation)
+// 5. Scientific ratios - stoichiometry, dilutions (precision required)
+// 6. Legal contracts - profit shares, equity splits (must be exact)
+
+// FRACTION TYPES BY WIDTH
+frac8:small = {0, 1, 127};          // Max denom: 127, 3 bytes (aligned to 4)
+frac16:medium = {100, 1, 2};        // Max whole: ±32767, 6 bytes (aligned to 8)  
+frac32:large = {1000000, 1, 3};     // Standard precision, 12 bytes (aligned to 16)
+frac64:precise = {0, 1, 999999999}; // High precision, 24 bytes (aligned to 32)
+
+// FRACTION SAFETY - ZERO-FAILURE GUARANTEE
+// All failure modes collapse to deterministic ERR state:
+// - Denominator overflow → ERR (not wraparound)
+// - Division by zero → ERR (not crash/exception)
+// - Component overflow → ERR (sticky propagation)
+// - Invalid operations → ERR (no undefined behavior)
+// Result: Safe for mission-critical systems (aerospace, medical, robotics)
+
+// TWISTED FLOATING POINT (tfp) - DETERMINISTIC REAL NUMBERS
+// Twisted Floating Point provides IEEE-free floating-point arithmetic
+// Built from TBB exponent + TBB mantissa, eliminating IEEE 754 problems
+// CRITICAL: No -0, no NaN ambiguity, cross-platform bit-exact determinism
+
+// TFP STRUCTURE - TBB COMPONENT COMPOSITION
+// tfp = Mantissa × 2^Exponent (both components are TBB types)
+// tfp32: tbb16 exponent + tbb16 mantissa (32 bits total)
+// tfp64: tbb16 exponent + tbb48 mantissa (64 bits total)
+// Sign lives in mantissa (2's complement), not separate bit
+
+// WHY TFP EXISTS - IEEE 754 PROBLEMS SOLVED
+// IEEE Problem 1: +0 and -0 are different (breaks zero neutrality)
+//   - 1.0 / +0.0 = +Inf, but 1.0 / -0.0 = -Inf (non-deterministic)
+//   - Phase calculations can flip sign due to rounding artifacts
+// IEEE Problem 2: Multiple NaN states (qNaN, sNaN, payload bits)
+//   - NaN propagates silently through calculations (no error detection)
+//   - Can't distinguish "sqrt(-1)" NaN from "0/0" NaN
+// IEEE Problem 3: Platform-dependent rounding
+//   - x86 FPU vs ARM NEON produce different bit patterns
+//   - Same code, different results on different CPUs
+
+// TFP Solution: Twisted Architecture
+// 1. UNIQUE ZERO: Only one zero (0x0000000000000000), no +0/-0
+// 2. UNIFIED ERR: All errors collapse to single ERR sentinel
+// 3. SOFTWARE IMPLEMENTATION: Bit-exact across all platforms
+// 4. STICKY ERROR PROPAGATION: ERR + anything = ERR
+
+// TFP64 STRUCTURE (64-bit Twisted Float)
+tfp64:value = 3.14159tf;              // Literal with 'tf' suffix
+tfp64:zero = 0.0tf;                   // Unique zero (no -0)
+tfp64:error = ERR;                    // Error sentinel
+
+// TFP ARITHMETIC - DETERMINISTIC OPERATIONS
+// All operations implemented in software (no hardware FPU)
+// Ensures identical results on x86, ARM, RISC-V, etc.
+tfp64:a = 1.5tf;
+tfp64:b = 2.7tf;
+tfp64:sum = a + b;                    // 4.2tf (bit-exact)
+tfp64:product = a * b;                // 4.05tf (bit-exact)
+tfp64:quotient = a / b;               // ~0.555556tf (bit-exact)
+
+// TFP ERROR STATES (Sticky ERR Propagation)
+// tfp is ERR if exponent is TBB ERR OR mantissa is TBB ERR
+tfp64:div_by_zero = 1.0tf / 0.0tf;    // ERR (not Inf)
+tfp64:sqrt_neg = sqrt(-1.0tf);        // ERR (not NaN)
+tfp64:overflow = 1.0e308tf * 1.0e308tf; // ERR (not Inf)
+tfp64:err_prop = error + 5.0tf;       // ERR (sticky propagation)
+
+// TFP VS IEEE 754 - SAFETY COMPARISON
+// IEEE 754 problem (non-determinism):
+//   float x = 0.1f + 0.2f;  // Might be 0.30000001 on x86, 0.29999998 on ARM
+//   if (x == 0.3f) { }      // Platform-dependent branch!
+//   sqrt(-1.0) = NaN        // Silent corruption, keeps calculating
+//   1.0 / 0.0 = Inf         // Spreads through calculation as "valid" number
+
+// Aria tfp solution (deterministic):
+tfp64:x = 0.1tf + 0.2tf;              // EXACT SAME BITS on all platforms
+if (x == 0.3tf) { }                   // Deterministic branch
+tfp64:bad = sqrt(-1.0tf);             // ERR (halts calculation branch)
+tfp64:div = 1.0tf / 0.0tf;            // ERR (detected immediately)
+
+// TFP LITERAL SYNTAX
+tfp64:pi = 3.14159265358979tf;        // 'tf' suffix for twisted float
+tfp64:sci = 1.23e-45tf;               // Scientific notation supported
+tfp64:tiny = 0.000001tf;              // Small values
+tfp64:huge = 1.0e100tf;               // Large values (if within range)
+
+// TFP PRECISION TRADE-OFFS
+// tfp64: 48-bit mantissa (vs IEEE double's 53-bit)
+//   - 5 fewer bits of precision (~15 decimal digits vs 16)
+//   - Trade-off: Determinism and safety over raw precision
+//   - Rationale: Rounding error drift often exceeds last 5 bits anyway
+// tfp32: 16-bit mantissa (vs IEEE float's 24-bit)
+//   - Lower precision, but deterministic and safe
+
+// TFP PERFORMANCE CHARACTERISTICS
+// Speed: ~10-50x slower than hardware IEEE float (software implementation)
+// Safety: 100% deterministic, no silent failures
+// Use case decision:
+//   - Need speed, can tolerate platform variance → use flt32/flt64 (IEEE)
+//   - Need safety, determinism, exact reproducibility → use tfp32/tfp64
+
+// TFP USE CASES - WHERE DETERMINISM MATTERS
+// 1. Physics simulations - wave interference, particle systems (no drift)
+// 2. Financial calculations - compound interest with exact reproducibility
+// 3. Scientific computing - deterministic results for peer review
+// 4. Game replays - exact state reproduction across platforms
+// 5. Distributed systems - consensus on floating-point calculations
+// 6. AGI/AI safety - cognitive models must be deterministic
+// 7. Mission-critical - aerospace, medical devices, robotics
+
+// TFP CROSS-PLATFORM GUARANTEE
+// Same source code produces identical bit patterns on:
+//   - x86-64 (Intel/AMD)
+//   - ARM64 (Apple Silicon, mobile)
+//   - RISC-V
+//   - Any future architecture
+// Verification: Hash output of tfp calculation = same on all platforms
+
+// TFP MATH LIBRARY (Deterministic Transcendentals)
+// All math functions implemented via Taylor series (software)
+// Guarantees bit-exact results across platforms
+tfp64:angle = 1.57079632679tf;        // π/2
+tfp64:sine = sin(angle);              // Exactly 1.0tf (via Taylor series)
+tfp64:cosine = cos(0.0tf);            // Exactly 1.0tf (via Taylor series)
+tfp64:root = sqrt(4.0tf);             // Exactly 2.0tf
+tfp64:invalid = sqrt(-1.0tf);         // ERR (domain error)
+
+// TFP ERROR PROPAGATION EXAMPLE (9D Toroidal Memory)
+// In physics simulation, sensor failure should halt calculation, not corrupt
+tfp64:sensor1 = readSensor(1);        // Returns tfp64
+tfp64:sensor2 = readSensor(2);        // Might return ERR (sensor offline)
+tfp64:combined = sensor1 + sensor2;   // ERR if either is ERR
+tfp64:distance = sqrt(combined);      // ERR propagates (not NaN)
+if (distance == ERR) {
+    halt_actuator();                  // Safe shutdown, no erratic behavior
+}
+
+// TFP SAFETY - ZERO-FAILURE GUARANTEE
+// All failure modes collapse to deterministic ERR state:
+// - Division by zero → ERR (not Inf)
+// - Domain errors (sqrt(-1)) → ERR (not NaN)
+// - Overflow/underflow → ERR (not Inf/denormal)
+// - Component ERR → whole value ERR (sticky propagation)
+// - Invalid operations → ERR (no undefined behavior)
+// Result: Safe for mission-critical systems where failure = lives at risk
+
+// TFP TYPES BY WIDTH
+tfp32:fast = 1.5tf;                   // 32-bit, lower precision
+tfp64:standard = 3.14159265tf;        // 64-bit, standard precision
 
 int8:i = 9;
 string:str = "whats up";
@@ -7501,7 +7385,369 @@ To validate the architecture, we simulate key use cases:
 ________________
 12. Conclusion
 The architecture defined in this specification represents a quantum leap for the Aria ecosystem. By transforming AriaBuild from a static utility into a modular, extensible platform, we enable it to adapt to the rigorous and varied demands of modern software development. The Hourglass Pattern ensures that the native plugin ecosystem remains stable and backward-compatible for decades, while the WASM Subsystem future-proofs the tool against security threats and platform fragmentation.
-The introduction of the IToolchain abstraction and the Graph Synthesis lifecycle effectively decouples the core build engine from the specifics of the Aria language, potentially allowing AriaBuild to evolve into a general-purpose meta-build system comparable to Bazel, but with a significantly lower barrier to entry. This specification provides the roadmap for the engineering team to commence implementation, starting with the Native C-API definition and the Plugin Loader infrastructure. The result will be a build system that is not just a tool, but a foundation for the entire Aria developer experience.﻿Architectural Specification and Implementation Report: Aria Build Configuration Parser
+The introduction of the IToolchain abstraction and the Graph Synthesis lifecycle effectively decouples the core build engine from the specifics of the Aria language, potentially allowing AriaBuild to evolve into a general-purpose meta-build system comparable to Bazel, but with a significantly lower barrier to entry. This specification provides the roadmap for the engineering team to commence implementation, starting with the Native C-API definition and the Plugin Loader infrastructure. The result will be a build system that is not just a tool, but a foundation for the entire Aria developer experience.﻿Architectural Specification for AriaBuild: A Deterministic, Declarative Build System for the Aria Language Ecosystem
+1. Introduction: The Imperative for a Modern, Whitespace-Insensitive Build Infrastructure
+The evolution of software engineering has been inextricably linked to the maturation of build systems. From the imperative shell scripts of the early UNIX era to the complex meta-build generators of the modern C++ ecosystem, the mechanism by which source code is transformed into executable artifacts defines the developer experience. For the Aria programming language, currently at version v0.0.7, reliance on legacy tools such as GNU Make presents a significant friction point.1 While Make established the paradigm of dependency-based compilation, its rigid adherence to significant whitespace—specifically the distinction between tabs and spaces—violates the Principle of Least Astonishment and introduces a class of "invisible" syntax errors that hinder productivity.2 Furthermore, the arcane syntax of Makefiles, which blends declarative dependency rules with imperative shell scripting, creates a steep learning curve and reduces maintainability for complex projects.3
+This report articulates the comprehensive design and architectural specification for AriaBuild, a bespoke build automation tool engineered specifically for Aria. The core design philosophy of AriaBuild is "Configuration as Data," rejecting the "Configuration as Code" model that often leads to non-deterministic build states. AriaBuild leverages a JSON-derivative syntax that aligns with Aria’s own object literal definition, ensuring a cohesive syntactic experience for developers.1 This syntax is strictly whitespace-insensitive, utilizing structural delimiters (braces and brackets) to define scope, thereby eliminating the fragility associated with indentation-based logic found in Make, YAML, or Python.4
+By integrating native support for variables and globbing (wildcard pattern matching), AriaBuild addresses the user's specific requirements for a modern, ergonomic tool. Crucially, this system is designed to interface directly with the ariac compiler and the LLVM runtime environment (lli), bridging the gap between high-level project definition and low-level compilation mechanics.1 This document details the syntactic grammar, the graph-theoretic underpinnings of the dependency engine, the implementation of recursive filesystem traversal (globbing), and the integration strategies with the existing Aria compiler frontend.
+2. Syntactic Definition: The Aria Build Configuration (ABC) Language
+The primary interface for any build system is its configuration file. For AriaBuild, we introduce the Aria Build Configuration (ABC) format. This format is designed to be a superset of JSON, retaining its rigorous data structure while relaxing its syntax to improve human readability and writability. The design explicitly rejects significant whitespace, opting instead for C-style block delimiters ({, }) which allow for flexible formatting and robust error recovery during parsing.4
+2.1 Lexical Structure and Deviation from Standard JSON
+Standard JSON (RFC 8259) is an excellent data interchange format but a poor configuration language due to its lack of comments and strict quoting rules.6 The ABC format addresses these deficiencies by adopting the specific object literal syntax used within the Aria language itself, creating a seamless mental model for developers.
+2.1.1 Structural Delimiters and Whitespace Independence
+In direct response to the requirement for non-whitespace sensitivity, ABC treats all whitespace (spaces, tabs, line feeds, carriage returns) purely as token separators. The structure of the build definition is determined solely by:
+* Braces {}: Denoting objects (scopes, targets, settings).
+* Brackets ``: Denoting ordered lists (source files, flags).
+* Colons :: Separating keys from values.
+* Commas ,: Separating elements in lists or objects (with support for trailing commas).
+This design allows the build file to be minified onto a single line or expanded with elaborate indentation without altering its semantic meaning, fundamentally resolving the "tab vs. space" conflict inherent in Makefiles.8
+2.1.2 Support for Comments
+A critical deficiency in standard JSON is the absence of comments. Build files serve as documentation for the build process, necessitating the ability to annotate complex configurations. AriaBuild adopts the Aria language's comment syntax:
+* Single-line comments: Initiated by // and continuing to the end of the line.1
+* Usage: These are legal anywhere whitespace is allowed, enabling developers to document specific flags or temporary exclusions directly alongside the configuration data.
+2.1.3 Identifier Syntax
+To reduce visual clutter (often referred to as "syntax noise"), ABC allows keys in key-value pairs to be unquoted if they constitute valid identifiers. Borrowing from the Aria lexer definitions (src/frontend/lexer/token.cpp), a valid identifier consists of alphanumeric characters and underscores, and must not start with a digit.1
+* Standard JSON: "source_dir": "src"
+* ABC Syntax: source_dir: "src"
+This minor syntactic sugar significantly improves readability, making the configuration look more like a native Aria struct declaration than a serialized data packet.1
+2.2 The Configuration Schema
+The build configuration is a hierarchical object model defined in a file typically named build.aria or aria.json. This file structure is validated against a schema to ensure type safety before the build process begins. The schema is divided into three primary sections: project, variables, and targets.
+Section
+	Type
+	Description
+	project
+	Object
+	Metadata regarding the project name, version, and Aria compatibility.
+	variables
+	Object
+	A dictionary of key-value pairs defining reusable string constants (e.g., paths, flags).
+	targets
+	List
+	An array of build target objects, each defining a discrete output artifact (executable, library).
+	2.2.1 The Variables Section
+The variables section serves as a symbol table for the build configuration. It allows users to define constants that can be interpolated into strings elsewhere in the file. This prevents magic strings and allows for centralized configuration management.10
+Example Variable Declaration:
+
+
+Code snippet
+
+
+
+
+variables: {
+   // Standard directories
+   src: "src",
+   bin: "dist/bin",
+   
+   // Compiler settings
+   optimization: "-O3",
+   include_path: "lib/std"
+}
+
+2.2.2 The Targets Section
+The targets section is the core of the declarative specification. Each object in this list represents a node in the dependency graph. Unlike Make, which conflates file dependencies with shell commands, AriaBuild separates the intent (what to build) from the mechanism (how to build it).
+Target Schema Fields:
+* name: Unique identifier for the target.
+* type: Enumeration (binary, library, script, test).
+* sources: List of strings, supporting glob patterns.
+* depends_on: List of strings referencing other target names.
+* output: Destination path for the compiled artifact (.ll file).
+* flags: List of compiler flags passed to ariac.
+2.3 Variable Substitution and String Interpolation
+AriaBuild implements a robust variable substitution engine using the specific syntax found in Aria template literals: backticks and the &{} marker.1 This design decision reinforces language consistency; the syntax used to interpolate strings in the build file is identical to the syntax used in the runtime source code.
+2.3.1 Syntax and Resolution Logic
+When the parser encounters a string token, it scans for the &{...} pattern. If found, the enclosed identifier is extracted and resolved against the current scope's symbol table.
+* Resolution Order:
+   1. Local Scope: Variables defined within the current target.
+   2. Global Scope: Variables defined in the root variables block.
+   3. Environment Scope: Variables prefixed with ENV. (e.g., &{ENV.HOME}), allowing the build to adapt to the host operating system.12
+Interpolation Example:
+
+
+Code snippet
+
+
+
+
+// Definition
+variables: {
+   out_dir: "build"
+}
+
+// Usage
+targets:
+
+This mechanisms allows for dynamic path construction without the overhead of a Turing-complete scripting language, maintaining the declarative nature of the system while providing necessary flexibility.14
+________________
+3. The Globbing Subsystem: Recursive Pattern Matching
+One of the critical requirements for AriaBuild is the support for globs—wildcard patterns that expand to a list of files. This feature allows developers to include entire directory trees (e.g., src/**/*.aria) without manually listing every source file, a feature that CMake notoriously lacked for years due to caching concerns.15
+3.1 The Need for a Custom Implementation
+A thorough analysis of the Aria runtime (src/runtime/io/ and stdlib/io.aria) reveals a significant capability gap: the current runtime supports basic file operations (readFile, fileExists) but explicitly lacks directory iteration or globbing functions.1 The standard library has no readdir, glob, or walk functions.
+Consequently, AriaBuild cannot rely on the Aria standard library to perform file discovery. Instead, the globbing subsystem must be implemented in the host language (C++) of the build tool itself, utilizing the C++17 std::filesystem library for directory traversal and regex/fnmatch for pattern matching.17
+3.2 Globbing Syntax Specifications
+AriaBuild supports the de facto standard globbing syntax used by shells (bash/zsh) and modern editors (VS Code).19
+* * (Asterisk): Matches any sequence of characters within a single path segment. It does not cross directory boundaries (separators).
+   * Example: src/*.aria matches src/main.aria but not src/utils/helper.aria.
+* ** (Double Asterisk): The recursive wildcard. Matches any sequence of characters, including directory separators.
+   * Example: src/**/*.aria matches src/main.aria, src/utils/helper.aria, and src/libs/math/vector.aria.
+* ? (Question Mark): Matches exactly one character.
+   * Example: test_?.aria matches test_1.aria but not test_10.aria.
+* [...] (Character Class): Matches any single character enclosed in the brackets.
+   * Example: file[0-9].aria.
+3.3 The Recursive Traversal Algorithm
+To implement ** efficiently without native OS support in the Aria runtime, AriaBuild utilizes std::filesystem::recursive_directory_iterator.21 The algorithm proceeds as follows:
+1. Pattern Parsing: The glob pattern string is decomposed into segments. A pattern like src/**/*.aria is split into a fixed root (src), a recursive directive (**), and a suffix matcher (*.aria).
+2. Root Anchoring: The search begins at the first non-wildcard segment. If the pattern is src/**/*.aria, the traversal is anchored at ./src.
+3. Recursive Iteration: The engine instantiates a recursive_directory_iterator at the anchor path.
+4. Filtering: For every entry visited:
+   * If it is a directory, the iterator descends (unless excluded).
+   * If it is a regular file, its relative path is matched against the remaining pattern using std::regex or a custom fnmatch implementation designed for path delimiters.18
+5. Exclusion: The system checks specific exclusion patterns (e.g., tests/**) defined in the target configuration and prunes the traversal accordingly.
+3.4 Caching and Determinism
+Globbing introduces non-determinism if files are added or removed without updating the configuration file. To mitigate this—a common critique in build system design 23—AriaBuild creates a snapshot of the glob expansion logic.
+* Manifest Generation: During the build initialization, all globs are expanded into a concrete list of files.
+* Cache Invalidation: This list is hashed and stored. On subsequent runs, if the glob pattern has not changed, the build tool can optionally use the cached file list (fast mode) or re-scan the filesystem (safe mode) to detect new files.
+* Sorting: To ensure deterministic builds (where the order of linking matters), the results of any glob expansion are strictly sorted alphabetically before being passed to the compiler. This prevents issues where the OS returns directory entries in an arbitrary order.23
+________________
+4. Dependency Graph Engine: Theory and Implementation
+The core logic of AriaBuild revolves around the construction and resolution of a Dependency Graph. This graph models the relationships between source files, build targets, and external modules, ensuring that artifacts are built in the mathematically correct order.
+4.1 Directed Acyclic Graph (DAG) Structure
+The build process is modeled as a DAG where:
+* Nodes ($V$) represent entities: Source files (.aria), Intermediate artifacts (.ll), and Targets (Executables/Libraries).
+* Edges ($E$) represent dependencies: An edge $A \to B$ implies "A depends on B," meaning B must be built before A.24
+For Aria, dependencies arise from two sources:
+1. Explicit Target Dependencies: Defined in the configuration file via depends_on. For example, the main target depends on the math_lib target.
+2. Implicit Source Dependencies: Derived by parsing source code. The Aria use statement (e.g., use std.io;) creates an implicit dependency between the consumer file and the module file.1
+4.2 Topological Sorting for Execution Scheduling
+To derive a linear execution schedule from the DAG, AriaBuild employs Topological Sorting. A topological sort of a DAG is a linear ordering of its vertices such that for every directed edge $uv$, vertex $u$ comes before vertex $v$ in the ordering.25
+4.2.1 Kahn’s Algorithm Implementation
+AriaBuild uses Kahn’s Algorithm for sorting due to its iterative nature and ability to easily detect cycles:
+1. Initialization: Calculate the in-degree (number of incoming dependency edges) for all nodes.
+2. Queue Population: Enqueue all nodes with an in-degree of 0 (independent tasks).
+3. Processing:
+   * Dequeue a node $N$ and add it to the BuildQueue.
+   * For each neighbor $M$ dependent on $N$, decrement $M$'s in-degree.
+   * If $M$'s in-degree becomes 0, enqueue $M$.
+4. Completion: If the BuildQueue size equals the total number of nodes, the sort is valid.
+4.2.2 Cycle Detection and Reporting
+If the queue becomes empty but nodes remain with non-zero in-degrees, a circular dependency exists (e.g., A depends on B, B depends on A). Unlike simpler tools that might hang or crash, AriaBuild detects this state. It performs a Depth First Search (DFS) on the remaining nodes to identify the specific cycle path (e.g., module A -> module B -> module A) and reports a descriptive error to the user, a critical feature for debugging complex module interactions.27
+4.3 Incremental Build Logic
+To optimize performance, AriaBuild avoids rebuilding targets that remain up-to-date. This is achieved through timestamp comparison, a technique prevalent in Make but refined here.
+* Logic: For a target $T$ with source inputs $S_1, S_2... S_n$:
+   1. Retrieve the last modification time $M(T)$ of the output artifact.
+   2. Retrieve the last modification times $M(S_i)$ for all inputs.
+   3. If $M(T)$ does not exist, or if $\max(M(S_i)) > M(T)$, the target is dirty and requires rebuilding.28
+* Aria Specifics: Since aria_file_size and aria_file_exists are the only metadata functions exposed in the standard library 1, the build tool itself must use C++ system calls (stat or std::filesystem::last_write_time) to perform these checks. This is a crucial architectural distinction: the build tool has capabilities the runtime currently lacks.1
+________________
+5. Toolchain Orchestration and Runtime Integration
+AriaBuild acts as a meta-driver for the existing Aria toolchain. It does not compile code directly but orchestrates the invocation of ariac and lli based on the resolved dependency graph.
+5.1 Invoking the ariac Compiler
+The Aria compiler (ariac) provides specific flags that the build system must utilize to function correctly 1:
+* Output Direction (-o): The build system explicitly maps the target's output variable to this flag.
+   * Command: ./ariac src/main.aria -o build/main.ll
+* Include Path Management (-I): Dependencies defined in the depends_on list are converted into include paths. If Target A depends on Target B (located in lib/B), the build system constructs the command with -I lib/B.
+* Preprocessing Debugging (-E): AriaBuild supports a --debug-macro mode. When enabled, it invokes ariac with the -E flag to generate preprocessed.aria. This allows developers to inspect macro expansions (like GEN_MAX or GEN_ABS from the guide 1) without compilation errors halting the process.
+5.2 Execution via LLVM Interpreter
+For targets of type binary, AriaBuild does not produce a native executable directly (as Aria currently compiles to LLVM IR). Instead, it acts as a wrapper for the lli tool.
+* Execution Flow:
+   1. AriaBuild ensures program.ll is up-to-date.
+   2. It constructs the command: lli build/program.ll.
+   3. It streams stdout and stderr from the child process to the user's console, handling standard file descriptors correctly via the platform abstraction layer.1
+5.3 LSP and IDE Support (compile_commands.json)
+To support the Aria Language Server (aria-ls), AriaBuild acts as the source of truth for project structure. It generates a compile_commands.json file in the build root. This JSON file is the standard for C/C++ tooling (and by extension Aria) to describe how each file is processed.29
+Format Example:
+
+
+JSON
+
+
+
+
+[
+ {
+   "directory": "/home/user/project",
+   "command": "./ariac src/main.aria -I lib -o build/main.ll",
+   "file": "src/main.aria"
+ }
+]
+
+The Aria LSP, which uses nlohmann/json for parsing, reads this file to understand include paths (-I), enabling features like "Go to Definition" for imported modules.1
+________________
+6. Implementation Specifications: Internal Data Structures
+The implementation of AriaBuild relies on a set of C++ structures designed to mirror the ABC configuration schema while supporting the runtime logic of the dependency graph.
+6.1 The Object Model
+The parser populates a BuildContext structure that holds the global state of the build.
+
+
+C++
+
+
+
+
+struct BuildContext {
+   // Symbol table for variable resolution
+   std::map<std::string, std::string> variables;
+   
+   // The dependency graph nodes
+   std::map<std::string, Target> targets;
+   
+   // Global settings
+   CompilerSettings settings;
+};
+
+struct Target {
+   std::string name;
+   TargetType type; // BINARY, LIBRARY, etc.
+   
+   // Expanded file lists (post-globbing)
+   std::vector<std::filesystem::path> source_files;
+   
+   // Dependency edges
+   std::vector<std::string> dependency_names;
+   
+   // Status flags
+   bool is_dirty;
+   bool visited; // For cycle detection
+   bool on_stack; // For cycle detection
+};
+
+6.2 Lexer Reuse Strategy
+To maintain strict compatibility with Aria source code, AriaBuild links against the aria_frontend library to reuse the Lexer class.1 This ensures that string literals (including backtick strings &{...}) and comments (//) are tokenized exactly as they are in the compiler.
+* Token Mapping:
+   * TOKEN_LEFT_BRACE ({): Starts an object.
+   * TOKEN_IDENTIFIER: Used for keys (src_dir) and variable names.
+   * TOKEN_STRING: Used for values ("src").
+   * TOKEN_TEMPLATE_START (`): Used for strings containing variables.
+6.3 Parallel Execution Scheduler
+Once the graph is sorted, AriaBuild utilizes a thread pool to execute tasks. The scheduler monitors the dependency graph:
+1. Identify all targets with in-degree == 0 (no unbuilt dependencies).
+2. Assign these targets to worker threads (up to std::thread::hardware_concurrency()).
+3. Upon target completion, update the graph by removing edges originating from the completed target.
+4. Repeat until the graph is empty.
+This parallelism is crucial for scaling build times on large multi-module Aria projects.23
+________________
+7. Comparative Analysis: AriaBuild vs. Existing Solutions
+Feature
+	GNU Make
+	CMake
+	Ninja
+	AriaBuild
+	Configuration Syntax
+	Makefile (Tab-sensitive)
+	CMakeLists.txt (Custom Lang)
+	Ninja (Machine Code)
+	ABC (JSON-like)
+	Whitespace Sensitivity
+	High (Fatal errors)
+	Low
+	Low
+	None (Delimiters)
+	Variable Syntax
+	$(VAR)
+	${VAR}
+	$var
+	&{VAR} (Aria native)
+	Globbing Support
+	wildcard function
+	Discouraged (CACHE issues)
+	No native globbing
+	Native Recursive
+	Dependency Resolution
+	Timestamp only
+	Timestamp / Hash
+	Timestamp
+	Timestamp + Module Import
+	Comments
+	#
+	#
+	#
+	// (Aria native)
+	Tooling Integration
+	Weak
+	Strong
+	Strong
+	Native (compile_commands)
+	Summary of Advantages:
+1. Ergonomics: By removing whitespace sensitivity and adopting JSON-like scoping, AriaBuild eliminates the most common frustration of Makefiles (tab errors).
+2. Consistency: Using &{var} and // aligns the build system with the language it builds, reducing context switching for developers.
+3. Modernity: Native support for recursive globs (**) removes the need for calling external shell commands like find, making builds portable across Windows and Linux.18
+________________
+8. Conclusion and Future Roadmap
+AriaBuild addresses the immediate need for a robust, developer-friendly build system within the Aria ecosystem. By discarding the legacy baggage of whitespace-sensitive parsing and adopting a declarative, JSON-based approach, it provides a stable foundation for project management. The architectural decision to implement globbing and timestamp analysis in the C++ host tool—bypassing the current limitations of the Aria runtime—ensures that the system is both performant and feature-complete immediately.
+8.1 Recommendations for Implementation
+1. Immediate: Implement the ConfigParser by extending aria::frontend::Parser to handle the ABC grammar.
+2. Short Term: Integrate std::filesystem to provide the globbing logic currently missing from stdlib/io.aria.
+3. Long Term: As the Aria runtime matures, expose the stat and directory iteration APIs to the standard library, allowing AriaBuild to eventually be self-hosted (written in Aria itself).
+8.2 Final Specification Snippet
+Below is the definitive reference for a valid build.aria file under this architecture:
+
+
+Code snippet
+
+
+
+
+// aria-build-config v1
+{
+   project: {
+       name: "MyAriaApp",
+       version: "0.1.0"
+   },
+
+   variables: {
+       // Global path definitions
+       src: "src",
+       libs: "vendor"
+   },
+
+   targets:
+       },
+       {
+           name: "main_app",
+           type: "binary",
+           sources: ["&{src}/*.aria"],
+           // Explicit dependency management
+           depends_on: ["core_lib"],
+           // Output mapped to -o flag
+           output: "bin/app.ll"
+       }
+   ]
+}
+
+This specification delivers a build system that is not only "better than Make" but uniquely adapted to the syntax, structure, and capabilities of the Aria programming language.
+Works cited
+1. ARIA_PROGRAMMING_GUIDE.txt
+2. For what reasons do some programmers vehemently hate languages where whitespace matters (eg Python)? [closed] - Stack Overflow, accessed December 19, 2025, https://stackoverflow.com/questions/2695286/for-what-reasons-do-some-programmers-vehemently-hate-languages-where-whitespace
+3. Taskfile: A Modern Alternative to Makefile | Hacker News, accessed December 19, 2025, https://news.ycombinator.com/item?id=36744450
+4. Builtin support for white space sensitive languages · Issue #219 · tree-sitter/tree-sitter - GitHub, accessed December 19, 2025, https://github.com/tree-sitter/tree-sitter/issues/219
+5. Ideas for a language that has no clutter : r/ProgrammingLanguages - Reddit, accessed December 19, 2025, https://www.reddit.com/r/ProgrammingLanguages/comments/1es6s3k/ideas_for_a_language_that_has_no_clutter/
+6. What is JSONC, what is JSON5. - Paji's Blog, accessed December 19, 2025, https://paji.blog/jsonc-json5
+7. JSON - Wikipedia, accessed December 19, 2025, https://en.wikipedia.org/wiki/JSON
+8. Why do we still have programming languages that rely on indentation / white space?, accessed December 19, 2025, https://softwareengineering.stackexchange.com/questions/391159/why-do-we-still-have-programming-languages-that-rely-on-indentation-white-spac
+9. JSON5 – JSON for Humans - Hacker News, accessed December 19, 2025, https://news.ycombinator.com/item?id=42360681
+10. How content designers can (and should) use JSON files - UX Content Collective, accessed December 19, 2025, https://uxcontent.com/content-design-json/
+11. Set globa Variables From JSON Variables - Stack Overflow, accessed December 19, 2025, https://stackoverflow.com/questions/28883097/set-globa-variables-from-json-variables
+12. Variables reference - Visual Studio Code, accessed December 19, 2025, https://code.visualstudio.com/docs/reference/variables-reference
+13. Configuration in ASP.NET Core - Microsoft Learn, accessed December 19, 2025, https://learn.microsoft.com/en-us/aspnet/core/fundamentals/configuration/?view=aspnetcore-10.0
+14. Variable syntax | Grafana documentation, accessed December 19, 2025, https://grafana.com/docs/grafana/latest/visualizations/dashboards/variables/variable-syntax/
+15. Proper file globbing in cmake with make and ninja - Stack Overflow, accessed December 19, 2025, https://stackoverflow.com/questions/48064402/proper-file-globbing-in-cmake-with-make-and-ninja
+16. Problems with Globbing in Build Systems - Embedded Artistry, accessed December 19, 2025, https://embeddedartistry.com/fieldatlas/problems-with-globbing-in-build-systems/
+17. File globbing in the standard library - Google Groups, accessed December 19, 2025, https://groups.google.com/a/isocpp.org/g/std-proposals/c/3iWOM56dSl4
+18. glob (programming) - Wikipedia, accessed December 19, 2025, https://en.wikipedia.org/wiki/Glob_(programming)
+19. Working with glob patterns in syntax - AWS CodePipeline, accessed December 19, 2025, https://docs.aws.amazon.com/codepipeline/latest/userguide/syntax-glob.html
+20. Glob Patterns Reference - Visual Studio Code, accessed December 19, 2025, https://code.visualstudio.com/docs/editor/glob-patterns
+21. std::filesystem::recursive_directory_iterator - cppreference.com - C++ Reference, accessed December 19, 2025, https://en.cppreference.com/w/cpp/filesystem/recursive_directory_iterator.html
+22. Simple glob in C++ on unix system? - Stack Overflow, accessed December 19, 2025, https://stackoverflow.com/questions/8401777/simple-glob-in-c-on-unix-system
+23. Learning Build Systems: Premake Wildcards vs CMake Globbing : r/cpp - Reddit, accessed December 19, 2025, https://www.reddit.com/r/cpp/comments/u8vrpt/learning_build_systems_premake_wildcards_vs_cmake/
+24. Introduction to the dependency graph - Tweag, accessed December 19, 2025, https://tweag.io/blog/2025-09-04-introduction-to-dependency-graph/
+25. Topological Sorting Explained: A Step-by-Step Guide for Dependency Resolution - Medium, accessed December 19, 2025, https://medium.com/@amit.anjani89/topological-sorting-explained-a-step-by-step-guide-for-dependency-resolution-1a6af382b065
+26. Topological sorting - Wikipedia, accessed December 19, 2025, https://en.wikipedia.org/wiki/Topological_sorting
+27. How to implement and resolve circular dependencies in a programming language with modules? : r/ProgrammingLanguages - Reddit, accessed December 19, 2025, https://www.reddit.com/r/ProgrammingLanguages/comments/sulsmb/how_to_implement_and_resolve_circular/
+28. Build System Rules and Algorithms - Embedded Artistry, accessed December 19, 2025, https://embeddedartistry.com/blog/2017/04/17/build-system-rules-and-algorithms/
+29. JSON Compilation Database Format Specification — Clang 22.0.0git documentation - LLVM, accessed December 19, 2025, https://clang.llvm.org/docs/JSONCompilationDatabase.html
+30. json config with glob pattern and editor variables support #650 - GitHub, accessed December 19, 2025, https://github.com/clangd/vscode-clangd/issues/650
+31. An overview of build systems (mostly for C++ projects) : r/cpp - Reddit, accessed December 19, 2025, https://www.reddit.com/r/cpp/comments/8zm66h/an_overview_of_build_systems_mostly_for_c_projects/
+32. Glob files *without* using a shell - Unix & Linux Stack Exchange, accessed December 19, 2025, https://unix.stackexchange.com/questions/605843/glob-files-without-using-a-shell﻿Architectural Specification and Implementation Report: Aria Build Configuration Parser
 1. Executive Summary and Strategic Context
 The software development lifecycle for the Aria programming language is undergoing a paradigm shift. As the ecosystem matures beyond its initial v0.0.7 release, the infrastructure supporting it must evolve from ad-hoc, imperative scripts to robust, declarative systems. The introduction of AriaBuild (internally aria_make) marks this transition, replacing legacy dependencies on GNU Make with a modern, concurrency-native build tool designed specifically for the Aria language specification. At the core of this system lies the Aria Build Configuration (ABC) format—a JSON-superset domain-specific language (DSL) that enforces a "Configuration as Data" philosophy.1
 This report details the architectural design and implementation of the ConfigParser, the critical subsystem responsible for ingesting, validating, and structuring ABC files. Unlike the general-purpose aria::Parser, which is optimized for the semantic complexities of the full Aria language (control flow, type inference, mathematical precedence), the ConfigParser addresses a distinct set of requirements: high-throughput parsing of hierarchical data, rigid structural enforcement, and tolerance for syntactic conveniences like unquoted keys.1

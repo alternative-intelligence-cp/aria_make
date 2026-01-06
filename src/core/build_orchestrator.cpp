@@ -6,6 +6,7 @@
  */
 
 #include "core/build_orchestrator.hpp"
+#include "glob/glob_bridge.hpp"
 
 // ABC Parser (from aria_utils)
 // Note: In production, this would be linked from aria_utils
@@ -115,13 +116,13 @@ struct BuildFileNode {
 } // namespace abc
 
 // =============================================================================
-// Simple Thread Pool for Parallel Builds
+// Thread Pool for Parallel Builds
 // =============================================================================
 
-class SimpleThreadPool {
+class ThreadPool {
 public:
-    explicit SimpleThreadPool(size_t threads) : stop_(false) {
-        for (size_t i = 0; i < threads; ++i) {
+    explicit ThreadPool(size_t num_threads) : stop_(false), active_(0) {
+        for (size_t i = 0; i < num_threads; ++i) {
             workers_.emplace_back([this] {
                 while (true) {
                     std::function<void()> task;
@@ -131,21 +132,29 @@ public:
                         if (stop_ && tasks_.empty()) return;
                         task = std::move(tasks_.front());
                         tasks_.pop();
+                        ++active_;
                     }
                     task();
+                    {
+                        std::unique_lock<std::mutex> lock(mutex_);
+                        --active_;
+                        if (tasks_.empty() && active_ == 0) {
+                            done_cv_.notify_all();
+                        }
+                    }
                 }
             });
         }
     }
 
-    ~SimpleThreadPool() {
+    ~ThreadPool() {
         {
             std::unique_lock<std::mutex> lock(mutex_);
             stop_ = true;
         }
         cv_.notify_all();
         for (auto& w : workers_) {
-            w.join();
+            if (w.joinable()) w.join();
         }
     }
 
@@ -159,19 +168,23 @@ public:
     }
 
     void wait_all() {
-        // Wait for all tasks to complete
         std::unique_lock<std::mutex> lock(mutex_);
         done_cv_.wait(lock, [this] { return tasks_.empty() && active_ == 0; });
+    }
+
+    size_t queue_size() const {
+        std::unique_lock<std::mutex> lock(mutex_);
+        return tasks_.size();
     }
 
 private:
     std::vector<std::thread> workers_;
     std::queue<std::function<void()>> tasks_;
-    std::mutex mutex_;
+    mutable std::mutex mutex_;
     std::condition_variable cv_;
     std::condition_variable done_cv_;
-    std::atomic<size_t> active_{0};
     bool stop_;
+    size_t active_;
 };
 
 // =============================================================================
@@ -535,53 +548,52 @@ bool BuildOrchestrator::expand_sources() {
         std::vector<std::string> expanded;
 
         for (const auto& pattern : target.sources) {
-            // Check if it's a glob pattern
-            if (pattern.find('*') != std::string::npos ||
-                pattern.find('?') != std::string::npos) {
+            // Check if it's a glob pattern (contains *, **, ?, or [...])
+            bool is_glob = pattern.find('*') != std::string::npos ||
+                           pattern.find('?') != std::string::npos ||
+                           pattern.find('[') != std::string::npos;
 
-                // Simple glob expansion
-                fs::path base = config_.project_root;
-                std::string glob_part = pattern;
+            if (is_glob) {
+                // Use the aglob engine for full pattern support
+                glob::GlobOptions opts;
+                opts.files_only = true;
+                opts.include_hidden = false;
 
-                // Extract base directory
-                auto slash_pos = pattern.find_last_of("/\\");
-                if (slash_pos != std::string::npos) {
-                    base = config_.project_root / pattern.substr(0, slash_pos);
-                    glob_part = pattern.substr(slash_pos + 1);
+                glob::GlobResult result = glob::expand_pattern(
+                    config_.project_root,
+                    pattern,
+                    opts
+                );
+
+                if (!result.ok()) {
+                    add_error("Glob expansion failed for '" + pattern + "': " +
+                              result.error_message);
+                    return false;
                 }
 
-                // Convert glob to regex
-                std::string regex_str = "^";
-                for (char c : glob_part) {
-                    if (c == '*') regex_str += ".*";
-                    else if (c == '?') regex_str += ".";
-                    else if (c == '.') regex_str += "\\.";
-                    else regex_str += c;
+                // Add matched files
+                for (auto& path : result.paths) {
+                    expanded.push_back(std::move(path));
                 }
-                regex_str += "$";
 
-                std::regex file_regex(regex_str);
-
-                // Scan directory
-                std::error_code ec;
-                if (fs::exists(base, ec)) {
-                    for (const auto& entry : fs::directory_iterator(base, ec)) {
-                        if (entry.is_regular_file()) {
-                            std::string filename = entry.path().filename().string();
-                            if (std::regex_match(filename, file_regex)) {
-                                expanded.push_back(entry.path().string());
-                            }
-                        }
-                    }
+                if (config_.verbose && result.paths.empty()) {
+                    std::cerr << "[WARN] Pattern '" << pattern
+                              << "' matched no files\n";
                 }
             } else {
                 // Direct file path
                 fs::path full_path = config_.project_root / pattern;
                 if (fs::exists(full_path)) {
                     expanded.push_back(full_path.string());
+                } else if (config_.verbose) {
+                    std::cerr << "[WARN] Source file not found: "
+                              << full_path << "\n";
                 }
             }
         }
+
+        // Sort for reproducibility (aglob does this, but merge needs it too)
+        std::sort(expanded.begin(), expanded.end());
 
         target.sources = std::move(expanded);
     }
@@ -589,29 +601,145 @@ bool BuildOrchestrator::expand_sources() {
     return true;
 }
 
+// =============================================================================
+// Dependency Extraction via Compiler API (ARIA-011)
+// =============================================================================
+// Uses `ariac --emit-deps` to get accurate module dependencies instead of regex.
+// This ensures the build system uses the same parsing logic as the compiler.
+
+std::vector<std::string> BuildOrchestrator::extract_dependencies_from_compiler(
+    const std::string& source_file) {
+
+    std::vector<std::string> modules;
+
+    // Build command: ariac <file> --emit-deps
+    std::ostringstream cmd;
+    cmd << config_.compiler << " " << source_file << " --emit-deps 2>&1";
+
+    // Execute command
+    std::array<char, 4096> buffer;
+    std::string result;
+
+    FILE* pipe = popen(cmd.str().c_str(), "r");
+    if (!pipe) {
+        if (config_.verbose) {
+            std::cout << "[WARN] Failed to run --emit-deps for: " << source_file << "\n";
+        }
+        return modules;
+    }
+
+    while (fgets(buffer.data(), buffer.size(), pipe) != nullptr) {
+        result += buffer.data();
+    }
+
+    int status = pclose(pipe);
+    if (status != 0) {
+        // Compiler failed - fall back to regex parsing
+        if (config_.verbose) {
+            std::cout << "[WARN] --emit-deps failed for " << source_file
+                      << ", using fallback\n";
+        }
+        return extract_dependencies_fallback(source_file);
+    }
+
+    // Parse JSON output: {"source": "...", "imports": [...], "error": null}
+    // Simple JSON parsing for our specific format
+    size_t imports_pos = result.find("\"imports\"");
+    if (imports_pos == std::string::npos) {
+        return modules;
+    }
+
+    // Find the array start
+    size_t array_start = result.find('[', imports_pos);
+    size_t array_end = result.find(']', array_start);
+    if (array_start == std::string::npos || array_end == std::string::npos) {
+        return modules;
+    }
+
+    // Extract module names from the imports array
+    // Format: [{"module": "std.io", "path": "..."}, ...]
+    std::string imports_str = result.substr(array_start, array_end - array_start + 1);
+
+    size_t pos = 0;
+    while ((pos = imports_str.find("\"module\"", pos)) != std::string::npos) {
+        // Find the module name value
+        size_t colon = imports_str.find(':', pos);
+        if (colon == std::string::npos) break;
+
+        size_t quote_start = imports_str.find('"', colon + 1);
+        if (quote_start == std::string::npos) break;
+
+        size_t quote_end = imports_str.find('"', quote_start + 1);
+        if (quote_end == std::string::npos) break;
+
+        std::string module_name = imports_str.substr(quote_start + 1,
+                                                      quote_end - quote_start - 1);
+
+        // Extract first component (e.g., "std" from "std.io")
+        size_t dot = module_name.find('.');
+        if (dot != std::string::npos) {
+            module_name = module_name.substr(0, dot);
+        }
+
+        if (!module_name.empty() &&
+            std::find(modules.begin(), modules.end(), module_name) == modules.end()) {
+            modules.push_back(module_name);
+        }
+
+        pos = quote_end + 1;
+    }
+
+    return modules;
+}
+
+std::vector<std::string> BuildOrchestrator::extract_dependencies_fallback(
+    const std::string& source_file) {
+
+    // Fallback: regex-based extraction for when compiler isn't available
+    std::vector<std::string> modules;
+    std::regex use_regex(R"(use\s+([a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z_][a-zA-Z0-9_]*)*))");
+
+    std::ifstream file(source_file);
+    if (!file) return modules;
+
+    std::string line;
+    while (std::getline(file, line)) {
+        std::smatch match;
+        if (std::regex_search(line, match, use_regex)) {
+            std::string module_name = match[1].str();
+
+            // Extract first component
+            size_t dot = module_name.find('.');
+            if (dot != std::string::npos) {
+                module_name = module_name.substr(0, dot);
+            }
+
+            if (std::find(modules.begin(), modules.end(), module_name) == modules.end()) {
+                modules.push_back(module_name);
+            }
+        }
+    }
+
+    return modules;
+}
+
 bool BuildOrchestrator::scan_dependencies() {
-    // Scan .aria files for 'use' statements to discover implicit dependencies
-    std::regex use_regex(R"(use\s+([a-zA-Z_][a-zA-Z0-9_]*))");
+    // Extract dependencies using compiler's --emit-deps API (ARIA-011)
+    // This uses the same parser as the compiler for accurate dependency detection
 
     for (const auto& target : targets_) {
         std::vector<std::string> deps = target.dependencies;
 
         for (const auto& source : target.sources) {
-            std::ifstream file(source);
-            if (!file) continue;
+            // Use compiler API to extract dependencies
+            std::vector<std::string> source_deps = extract_dependencies_from_compiler(source);
 
-            std::string line;
-            while (std::getline(file, line)) {
-                std::smatch match;
-                if (std::regex_search(line, match, use_regex)) {
-                    std::string dep_name = match[1].str();
-
-                    // Check if this matches another target
-                    for (const auto& t : targets_) {
-                        if (t.name == dep_name &&
-                            std::find(deps.begin(), deps.end(), dep_name) == deps.end()) {
-                            deps.push_back(dep_name);
-                        }
+            for (const auto& dep_name : source_deps) {
+                // Check if this matches another target
+                for (const auto& t : targets_) {
+                    if (t.name == dep_name &&
+                        std::find(deps.begin(), deps.end(), dep_name) == deps.end()) {
+                        deps.push_back(dep_name);
                     }
                 }
             }
@@ -779,7 +907,16 @@ bool BuildOrchestrator::execute_builds() {
     std::error_code ec;
     fs::create_directories(config_.output_dir, ec);
 
-    // Build targets in topological order
+    // For single-threaded or dry-run, use simple sequential build
+    if (config_.num_threads == 1 || config_.dry_run) {
+        return execute_builds_sequential();
+    }
+
+    // Parallel build with dependency tracking
+    return execute_builds_parallel();
+}
+
+bool BuildOrchestrator::execute_builds_sequential() {
     size_t built = 0;
     for (const auto& target_name : build_order_) {
         if (cancelled_) {
@@ -788,10 +925,9 @@ bool BuildOrchestrator::execute_builds() {
         }
 
         if (dirty_targets_.find(target_name) == dirty_targets_.end()) {
-            continue;  // Skip up-to-date targets
+            continue;
         }
 
-        // Find the target
         const BuildTarget* target = nullptr;
         for (const auto& t : targets_) {
             if (t.name == target_name) {
@@ -799,61 +935,16 @@ bool BuildOrchestrator::execute_builds() {
                 break;
             }
         }
-
         if (!target) continue;
 
         report_progress(BuildPhase::COMPILING, built, dirty_targets_.size(), target_name,
                         "Building " + target_name + "...");
 
-        auto compile_start = std::chrono::steady_clock::now();
-
         if (!config_.dry_run) {
-            std::string stdout_out, stderr_out;
-
-            // Collect all flags
-            std::vector<std::string> all_flags = config_.global_flags;
-            all_flags.insert(all_flags.end(), target->flags.begin(), target->flags.end());
-
-            int result = execute_compile(
-                target_name,
-                target->sources,
-                target->output_path,
-                all_flags,
-                stdout_out,
-                stderr_out
-            );
-
-            if (result != 0) {
-                add_error("Failed to build " + target_name + ": " + stderr_out);
-                result_.failed_targets++;
-
-                if (config_.fail_fast) {
-                    return false;
-                }
-            } else {
-                // Update state
-                std::vector<DependencyInfo> deps;
-                std::vector<std::string> impl_deps;
-
-                auto compile_end = std::chrono::steady_clock::now();
-                auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(
-                    compile_end - compile_start);
-
-                state_.update_record(
-                    target_name,
-                    target->output_path,
-                    target->sources,
-                    deps,
-                    impl_deps,
-                    all_flags,
-                    duration.count()
-                );
-
-                result_.built_targets++;
-                result_.target_times.emplace_back(target_name, duration);
+            if (!build_single_target(*target)) {
+                if (config_.fail_fast) return false;
             }
         } else {
-            // Dry run - just print what would be done
             if (config_.verbose) {
                 std::cout << "[DRY RUN] Would build: " << target_name << "\n";
                 for (const auto& src : target->sources) {
@@ -863,11 +954,185 @@ bool BuildOrchestrator::execute_builds() {
             }
             result_.built_targets++;
         }
-
         built++;
+    }
+    return result_.failed_targets == 0;
+}
+
+bool BuildOrchestrator::execute_builds_parallel() {
+    // Build dependency count map (how many deps each target has)
+    std::unordered_map<std::string, std::atomic<int>> dep_count;
+    std::unordered_map<std::string, std::vector<std::string>> reverse_deps;
+
+    // Initialize dependency counts for dirty targets only
+    for (const auto& target_name : dirty_targets_) {
+        dep_count[target_name] = 0;
+    }
+
+    // Count dependencies (only count dirty deps)
+    for (const auto& target_name : dirty_targets_) {
+        if (dependencies_.count(target_name)) {
+            for (const auto& dep : dependencies_[target_name]) {
+                if (dirty_targets_.count(dep)) {
+                    dep_count[target_name]++;
+                    reverse_deps[dep].push_back(target_name);
+                }
+            }
+        }
+    }
+
+    // Thread-safe state for parallel execution
+    std::mutex result_mutex;
+    std::atomic<size_t> built_count{0};
+    std::atomic<bool> has_failure{false};
+    std::condition_variable ready_cv;
+    std::mutex ready_mutex;
+    std::queue<std::string> ready_queue;
+
+    // Find initially ready targets (no dirty deps)
+    for (const auto& target_name : dirty_targets_) {
+        if (dep_count[target_name] == 0) {
+            std::lock_guard<std::mutex> lock(ready_mutex);
+            ready_queue.push(target_name);
+        }
+    }
+
+    // Create thread pool
+    ThreadPool pool(config_.num_threads);
+    size_t total_dirty = dirty_targets_.size();
+
+    // Worker function to build a single target
+    auto build_task = [&](const std::string& target_name) {
+        if (cancelled_ || (config_.fail_fast && has_failure)) {
+            return;
+        }
+
+        // Find target
+        const BuildTarget* target = nullptr;
+        for (const auto& t : targets_) {
+            if (t.name == target_name) {
+                target = &t;
+                break;
+            }
+        }
+        if (!target) return;
+
+        // Report progress
+        {
+            std::lock_guard<std::mutex> lock(result_mutex);
+            report_progress(BuildPhase::COMPILING, built_count, total_dirty,
+                            target_name, "Building " + target_name + "...");
+        }
+
+        // Build the target
+        bool success = build_single_target(*target);
+
+        {
+            std::lock_guard<std::mutex> lock(result_mutex);
+            if (!success) {
+                has_failure = true;
+            }
+        }
+
+        built_count++;
+
+        // Notify dependents that this target is complete
+        if (reverse_deps.count(target_name)) {
+            for (const auto& dependent : reverse_deps[target_name]) {
+                int remaining = --dep_count[dependent];
+                if (remaining == 0) {
+                    // This dependent is now ready to build
+                    {
+                        std::lock_guard<std::mutex> lock(ready_mutex);
+                        ready_queue.push(dependent);
+                    }
+                    ready_cv.notify_one();
+                }
+            }
+        }
+    };
+
+    // Main scheduling loop
+    while (built_count < total_dirty && !cancelled_ &&
+           !(config_.fail_fast && has_failure)) {
+
+        std::string next_target;
+        {
+            std::unique_lock<std::mutex> lock(ready_mutex);
+            if (ready_queue.empty()) {
+                // Wait for more work or completion
+                ready_cv.wait_for(lock, std::chrono::milliseconds(100));
+                continue;
+            }
+            next_target = ready_queue.front();
+            ready_queue.pop();
+        }
+
+        pool.enqueue([&, target = next_target]() {
+            build_task(target);
+            ready_cv.notify_one();
+        });
+    }
+
+    // Wait for all in-flight builds to complete
+    pool.wait_all();
+
+    if (cancelled_) {
+        add_error("Build cancelled");
+        return false;
     }
 
     return result_.failed_targets == 0;
+}
+
+bool BuildOrchestrator::build_single_target(const BuildTarget& target) {
+    auto compile_start = std::chrono::steady_clock::now();
+
+    std::string stdout_out, stderr_out;
+    std::vector<std::string> all_flags = config_.global_flags;
+    all_flags.insert(all_flags.end(), target.flags.begin(), target.flags.end());
+
+    int result;
+    if (target.type == "library") {
+        result = build_library(target, all_flags, stdout_out, stderr_out);
+    } else {
+        result = execute_compile(
+            target.name,
+            target.sources,
+            target.output_path,
+            all_flags,
+            stdout_out,
+            stderr_out
+        );
+    }
+
+    auto compile_end = std::chrono::steady_clock::now();
+    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(
+        compile_end - compile_start);
+
+    if (result != 0) {
+        add_error("Failed to build " + target.name + ": " + stderr_out);
+        result_.failed_targets++;
+        return false;
+    }
+
+    // Update state (thread-safe - StateManager uses mutex)
+    std::vector<DependencyInfo> deps;
+    std::vector<std::string> impl_deps;
+
+    state_.update_record(
+        target.name,
+        target.output_path,
+        target.sources,
+        deps,
+        impl_deps,
+        all_flags,
+        duration.count()
+    );
+
+    result_.built_targets++;
+    result_.target_times.emplace_back(target.name, duration);
+    return true;
 }
 
 bool BuildOrchestrator::save_state() {
@@ -925,6 +1190,101 @@ int BuildOrchestrator::execute_compile(
 
     if (status != 0) {
         stderr_out = result;
+    }
+
+    return status;
+}
+
+int BuildOrchestrator::build_library(
+    const BuildTarget& target,
+    const std::vector<std::string>& flags,
+    std::string& stdout_out,
+    std::string& stderr_out) {
+
+    // Create objects directory for intermediate files
+    fs::path obj_dir = config_.output_dir / "obj" / target.name;
+    std::error_code ec;
+    fs::create_directories(obj_dir, ec);
+
+    std::vector<std::string> object_files;
+
+    // Step 1: Compile each source to object file
+    for (const auto& source : target.sources) {
+        fs::path src_path(source);
+        fs::path obj_path = obj_dir / (src_path.stem().string() + ".o");
+
+        // Build compile command
+        std::ostringstream cmd;
+        cmd << config_.compiler << " -c";
+
+        for (const auto& flag : flags) {
+            cmd << " " << flag;
+        }
+
+        cmd << " -o " << obj_path.string();
+        cmd << " " << source;
+        cmd << " 2>&1";
+
+        if (config_.verbose) {
+            std::cout << "[CMD] " << cmd.str() << "\n";
+        }
+
+        // Execute
+        std::array<char, 128> buffer;
+        std::string result;
+
+        FILE* pipe = popen(cmd.str().c_str(), "r");
+        if (!pipe) {
+            stderr_out = "Failed to execute compiler for " + source;
+            return -1;
+        }
+
+        while (fgets(buffer.data(), buffer.size(), pipe) != nullptr) {
+            result += buffer.data();
+        }
+
+        int status = pclose(pipe);
+        if (status != 0) {
+            stderr_out = result;
+            return status;
+        }
+
+        object_files.push_back(obj_path.string());
+    }
+
+    // Step 2: Create static library with ar
+    std::ostringstream ar_cmd;
+    ar_cmd << "ar rcs " << target.output_path.string();
+
+    for (const auto& obj : object_files) {
+        ar_cmd << " " << obj;
+    }
+
+    ar_cmd << " 2>&1";
+
+    if (config_.verbose) {
+        std::cout << "[CMD] " << ar_cmd.str() << "\n";
+    }
+
+    // Execute ar
+    std::array<char, 128> buffer;
+    std::string result;
+
+    FILE* pipe = popen(ar_cmd.str().c_str(), "r");
+    if (!pipe) {
+        stderr_out = "Failed to execute ar archiver";
+        return -1;
+    }
+
+    while (fgets(buffer.data(), buffer.size(), pipe) != nullptr) {
+        result += buffer.data();
+    }
+
+    int status = pclose(pipe);
+    if (status != 0) {
+        stderr_out = result;
+    } else {
+        stdout_out = "Created library: " + target.output_path.string();
     }
 
     return status;

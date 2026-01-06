@@ -2,7 +2,7 @@
 set -e
 wdir="$(dirname "$(readlink -f "$0")")" #/home/randy/._____RANDY_____/REPOS/aria_make/docs
 odir="$wdir"
-ofile="compiled.txt"
+ofile="aria_make_research_full.txt"
 out="$odir/$ofile"
 info="$wdir/info"
 research="$wdir/research"

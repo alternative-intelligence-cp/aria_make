@@ -65,6 +65,67 @@ set_target_properties(aria_make_state PROPERTIES
 )
 
 # -----------------------------------------------------------------------------
+# Library: aria_make_abc (ABC Config Parser - ARIA-019)
+# -----------------------------------------------------------------------------
+add_library(aria_make_abc STATIC
+    src/abc/abc_lexer.cpp
+    src/abc/abc_parser.cpp
+    src/abc/abc_interpolate.cpp
+)
+
+target_include_directories(aria_make_abc
+    PUBLIC
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+        $<INSTALL_INTERFACE:include>
+)
+
+set_target_properties(aria_make_abc PROPERTIES
+    VERSION ${PROJECT_VERSION}
+    POSITION_INDEPENDENT_CODE ON
+)
+
+# -----------------------------------------------------------------------------
+# aglob library from aria_utils
+# -----------------------------------------------------------------------------
+set(AGLOB_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../aria_utils/src/aglob"
+    CACHE PATH "Path to aglob library")
+
+if(EXISTS "${AGLOB_ROOT}/include/aglob/glob_engine.hpp")
+    message(STATUS "Found aglob at: ${AGLOB_ROOT}")
+    set(AGLOB_FOUND TRUE)
+else()
+    message(WARNING "aglob not found at ${AGLOB_ROOT} - glob expansion limited")
+    set(AGLOB_FOUND FALSE)
+endif()
+
+# -----------------------------------------------------------------------------
+# Library: aria_make_glob (Glob bridge component)
+# -----------------------------------------------------------------------------
+add_library(aria_make_glob STATIC
+    src/glob/glob_bridge.cpp
+)
+
+target_include_directories(aria_make_glob
+    PUBLIC
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+        $<INSTALL_INTERFACE:include>
+)
+
+if(AGLOB_FOUND)
+    # Add aglob subdirectory if not already built
+    if(NOT TARGET aglob)
+        add_subdirectory(${AGLOB_ROOT} ${CMAKE_BINARY_DIR}/aglob EXCLUDE_FROM_ALL)
+    endif()
+    target_link_libraries(aria_make_glob PUBLIC aglob)
+    target_compile_definitions(aria_make_glob PRIVATE ARIA_MAKE_HAS_AGLOB=1)
+endif()
+
+set_target_properties(aria_make_glob PROPERTIES
+    VERSION ${PROJECT_VERSION}
+    POSITION_INDEPENDENT_CODE ON
+)
+
+# -----------------------------------------------------------------------------
 # Library: aria_make_core (Build Orchestrator component)
 # -----------------------------------------------------------------------------
 add_library(aria_make_core STATIC
@@ -77,7 +138,7 @@ target_include_directories(aria_make_core
         $<INSTALL_INTERFACE:include>
 )
 
-target_link_libraries(aria_make_core PUBLIC aria_make_state Threads::Threads)
+target_link_libraries(aria_make_core PUBLIC aria_make_state aria_make_abc aria_make_glob Threads::Threads)
 
 set_target_properties(aria_make_core PROPERTIES
     VERSION ${PROJECT_VERSION}

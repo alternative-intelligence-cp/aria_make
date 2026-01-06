@@ -7,16 +7,22 @@
  * - StateManager for incremental build state tracking
  * - DependencyGraph for dependency analysis and cycle detection
  * - Parallel execution via thread pool
+ * - Compiler API integration (ariac --emit-deps) for accurate dependency extraction
  *
  * Build Flow:
  * 1. Parse build.abc -> BuildFileNode AST
  * 2. Load previous build state from .aria_make/state.json
- * 3. Build DependencyGraph from targets + scan .aria files for 'use' deps
+ * 3. Build DependencyGraph from targets + extract deps via compiler --emit-deps (ARIA-011)
  * 4. Detect cycles (abort if found)
- * 5. Mark dirty nodes based on StateManager analysis
+ * 5. Mark dirty nodes based on StateManager analysis (content hashing)
  * 6. Topological sort for build order
  * 7. Execute parallel builds via thread pool
  * 8. Update and save build state
+ *
+ * Ecosystem Integration:
+ * - Uses ariac --emit-deps for accurate `use` statement parsing (ecosystem/03_DependencyGraph)
+ * - Falls back to regex if compiler unavailable (for testing without compiler)
+ * - StateManager uses content hashing for cache correctness (ecosystem/02_StateManager)
  *
  * Copyright (c) 2025 Aria Language Project
  */
@@ -261,8 +267,13 @@ private:
     // Stage 7: Mark dirty targets
     bool mark_dirty_targets();
 
-    // Stage 8: Execute builds in parallel
+    // Stage 8: Execute builds
     bool execute_builds();
+    bool execute_builds_sequential();  // Single-threaded fallback
+    bool execute_builds_parallel();    // Multi-threaded with dependency tracking
+
+    // Build a single target (used by both sequential and parallel)
+    bool build_single_target(const BuildTarget& target);
 
     // Stage 9: Save build state
     bool save_state();
@@ -271,6 +282,13 @@ private:
     // Helper Functions
     // =========================================================================
 
+    // Extract dependencies using compiler's --emit-deps API (ARIA-011)
+    // This uses the same parser as the compiler for accurate dependency detection
+    std::vector<std::string> extract_dependencies_from_compiler(const std::string& source_file);
+
+    // Fallback regex-based dependency extraction (when compiler unavailable)
+    std::vector<std::string> extract_dependencies_fallback(const std::string& source_file);
+
     // Execute a single compile command
     int execute_compile(const std::string& target_name,
                         const std::vector<std::string>& sources,
@@ -278,6 +296,12 @@ private:
                         const std::vector<std::string>& flags,
                         std::string& stdout_out,
                         std::string& stderr_out);
+
+    // Build a static library (compile sources + ar archive)
+    int build_library(const BuildTarget& target,
+                      const std::vector<std::string>& flags,
+                      std::string& stdout_out,
+                      std::string& stderr_out);
 
     // Build the compile command for a target
     std::vector<std::string> build_command(const BuildTarget& target);
