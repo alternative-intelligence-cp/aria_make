@@ -6,6 +6,8 @@
  */
 
 #include "core/build_orchestrator.hpp"
+#include "core/compiler_interface.hpp"
+#include "core/c_compiler_interface.hpp"
 #include "glob/glob_bridge.hpp"
 
 // ABC Parser (from aria_utils)
@@ -520,11 +522,30 @@ bool BuildOrchestrator::extract_targets() {
         if (const auto* flags = obj.get_array("flags")) {
             target.flags = flags->to_string_vector();
         }
+        
+        // Get link libraries (for FFI)
+        if (const auto* link_libs = obj.get_array("link_libraries")) {
+            target.link_libraries = link_libs->to_string_vector();
+        }
+        
+        // Get library search paths
+        if (const auto* link_paths = obj.get_array("link_paths")) {
+            target.link_paths = link_paths->to_string_vector();
+        }
+        
+        // Get compiler (for C/C++ targets)
+        target.compiler = obj.get_string("compiler", "");
+        
+        // Get explicit output (for C libraries)
+        target.output = obj.get_string("output", "");
 
         // Compute output path
-        if (target.type == "binary") {
+        if (!target.output.empty()) {
+            // Explicit output specified
+            target.output_path = config_.output_dir / target.output;
+        } else if (target.type == "binary") {
             target.output_path = config_.output_dir / target.name;
-        } else if (target.type == "library") {
+        } else if (target.type == "library" || target.type == "c_library") {
             target.output_path = config_.output_dir / ("lib" + target.name + ".a");
         } else {
             target.output_path = config_.output_dir / (target.name + ".o");
@@ -1093,14 +1114,38 @@ bool BuildOrchestrator::build_single_target(const BuildTarget& target) {
     all_flags.insert(all_flags.end(), target.flags.begin(), target.flags.end());
 
     int result;
-    if (target.type == "library") {
+    
+    // Route to appropriate compiler based on target type
+    if (target.type == "c_library") {
+        // C/C++ library compilation
+        result = build_c_library(target, all_flags, stdout_out, stderr_out);
+    } else if (target.type == "library") {
+        // Aria library (requires ariac -c support)
         result = build_library(target, all_flags, stdout_out, stderr_out);
     } else {
+        // Binary target - may need linking flags
+        std::vector<std::string> link_flags = all_flags;
+        
+        // Add linking flags for FFI
+        for (const auto& lib_path : target.link_paths) {
+            // Convert relative paths to absolute based on project root
+            fs::path full_path;
+            if (fs::path(lib_path).is_absolute()) {
+                full_path = lib_path;
+            } else {
+                full_path = config_.project_root / lib_path;
+            }
+            link_flags.push_back("-L" + full_path.string());
+        }
+        for (const auto& lib : target.link_libraries) {
+            link_flags.push_back("-l" + lib);
+        }
+        
         result = execute_compile(
             target.name,
             target.sources,
             target.output_path,
-            all_flags,
+            link_flags,
             stdout_out,
             stderr_out
         );
@@ -1151,48 +1196,45 @@ int BuildOrchestrator::execute_compile(
     std::string& stdout_out,
     std::string& stderr_out) {
 
-    // Build command
-    std::ostringstream cmd;
-    cmd << config_.compiler;
+    try {
+        // Create compiler interface
+        aria_make::CompilerInterface compiler(config_.compiler);
 
-    for (const auto& flag : flags) {
-        cmd << " " << flag;
-    }
+        // Build compilation task
+        aria_make::CompilerInterface::CompileTask task;
+        task.sources = sources;
+        task.output = output.string();
+        task.flags = flags;
 
-    cmd << " -o " << output.string();
+        if (config_.verbose) {
+            std::cout << "[CMD] " << config_.compiler;
+            for (const auto& src : sources) {
+                std::cout << " " << src;
+            }
+            std::cout << " -o " << output.string();
+            for (const auto& flag : flags) {
+                std::cout << " " << flag;
+            }
+            std::cout << "\n";
+        }
 
-    for (const auto& src : sources) {
-        cmd << " " << src;
-    }
+        // Execute compilation
+        auto result = compiler.compile(task);
 
-    cmd << " 2>&1";
+        stdout_out = result.stdout_output;
+        stderr_out = result.stderr_output;
 
-    if (config_.verbose) {
-        std::cout << "[CMD] " << cmd.str() << "\n";
-    }
+        if (config_.verbose && result.exit_code == 0) {
+            std::cout << "[OK] " << target_name << " compiled in " 
+                      << result.duration.count() << "ms\n";
+        }
 
-    // Execute command
-    std::array<char, 128> buffer;
-    std::string result;
+        return result.exit_code;
 
-    FILE* pipe = popen(cmd.str().c_str(), "r");
-    if (!pipe) {
-        stderr_out = "Failed to execute compiler";
+    } catch (const std::exception& e) {
+        stderr_out = std::string("Compiler invocation failed: ") + e.what();
         return -1;
     }
-
-    while (fgets(buffer.data(), buffer.size(), pipe) != nullptr) {
-        result += buffer.data();
-    }
-
-    int status = pclose(pipe);
-    stdout_out = result;
-
-    if (status != 0) {
-        stderr_out = result;
-    }
-
-    return status;
 }
 
 int BuildOrchestrator::build_library(
@@ -1209,47 +1251,45 @@ int BuildOrchestrator::build_library(
     std::vector<std::string> object_files;
 
     // Step 1: Compile each source to object file
-    for (const auto& source : target.sources) {
-        fs::path src_path(source);
-        fs::path obj_path = obj_dir / (src_path.stem().string() + ".o");
+    try {
+        aria_make::CompilerInterface compiler(config_.compiler);
 
-        // Build compile command
-        std::ostringstream cmd;
-        cmd << config_.compiler << " -c";
+        for (const auto& source : target.sources) {
+            fs::path src_path(source);
+            fs::path obj_path = obj_dir / (src_path.stem().string() + ".o");
 
-        for (const auto& flag : flags) {
-            cmd << " " << flag;
+            // Build compilation task for object file
+            aria_make::CompilerInterface::CompileTask task;
+            task.sources = {source};
+            task.output = obj_path.string();
+            
+            // Add -c flag for object file compilation (if supported by ariac)
+            task.flags = flags;
+            task.flags.push_back("-c");
+
+            if (config_.verbose) {
+                std::cout << "[CMD] " << config_.compiler << " -c";
+                for (const auto& flag : flags) {
+                    std::cout << " " << flag;
+                }
+                std::cout << " -o " << obj_path.string();
+                std::cout << " " << source << "\n";
+            }
+
+            // Execute compilation
+            auto result = compiler.compile(task);
+
+            if (result.exit_code != 0) {
+                stderr_out = result.stderr_output;
+                return result.exit_code;
+            }
+
+            object_files.push_back(obj_path.string());
         }
 
-        cmd << " -o " << obj_path.string();
-        cmd << " " << source;
-        cmd << " 2>&1";
-
-        if (config_.verbose) {
-            std::cout << "[CMD] " << cmd.str() << "\n";
-        }
-
-        // Execute
-        std::array<char, 128> buffer;
-        std::string result;
-
-        FILE* pipe = popen(cmd.str().c_str(), "r");
-        if (!pipe) {
-            stderr_out = "Failed to execute compiler for " + source;
-            return -1;
-        }
-
-        while (fgets(buffer.data(), buffer.size(), pipe) != nullptr) {
-            result += buffer.data();
-        }
-
-        int status = pclose(pipe);
-        if (status != 0) {
-            stderr_out = result;
-            return status;
-        }
-
-        object_files.push_back(obj_path.string());
+    } catch (const std::exception& e) {
+        stderr_out = std::string("Library compilation failed: ") + e.what();
+        return -1;
     }
 
     // Step 2: Create static library with ar
@@ -1326,6 +1366,134 @@ void BuildOrchestrator::report_progress(BuildPhase phase, size_t current, size_t
 
 void BuildOrchestrator::add_error(const std::string& error) {
     result_.errors.push_back(error);
+}
+
+// =============================================================================
+// C/C++ Compilation Support
+// =============================================================================
+
+bool BuildOrchestrator::is_c_source(const std::string& path) const {
+    fs::path p(path);
+    std::string ext = p.extension().string();
+    return ext == ".c" || ext == ".C";
+}
+
+bool BuildOrchestrator::is_cpp_source(const std::string& path) const {
+    fs::path p(path);
+    std::string ext = p.extension().string();
+    return ext == ".cpp" || ext == ".cc" || ext == ".cxx" || 
+           ext == ".C++" || ext == ".CPP";
+}
+
+bool BuildOrchestrator::is_aria_source(const std::string& path) const {
+    fs::path p(path);
+    return p.extension() == ".aria";
+}
+
+std::string BuildOrchestrator::detect_c_compiler(const BuildTarget& target) const {
+    // Explicit compiler specified
+    if (!target.compiler.empty()) {
+        // If it's a full path, use it directly
+        if (target.compiler[0] == '/' || target.compiler.find('/') != std::string::npos) {
+            return target.compiler;
+        }
+        // Otherwise map to full path
+        if (target.compiler == "gcc") return "/usr/bin/gcc";
+        if (target.compiler == "g++") return "/usr/bin/g++";
+        if (target.compiler == "clang") return "/usr/bin/clang";
+        if (target.compiler == "clang++") return "/usr/bin/clang++";
+        // Fallback: assume it's a full path
+        return target.compiler;
+    }
+    
+    // Detect from source files
+    for (const auto& src : target.sources) {
+        if (is_cpp_source(src)) {
+            return "/usr/bin/g++";  // C++ sources need g++/clang++
+        }
+    }
+    
+    return "/usr/bin/gcc";  // Default to gcc for C
+}
+
+int BuildOrchestrator::build_c_library(
+    const BuildTarget& target,
+    const std::vector<std::string>& flags,
+    std::string& stdout_out,
+    std::string& stderr_out) {
+    
+    try {
+        std::string compiler_path = detect_c_compiler(target);
+        bool is_cpp = is_cpp_source(target.sources[0]);
+        
+        aria_make::CCompilerInterface compiler(compiler_path, is_cpp);
+        
+        // Create objects directory
+        fs::path obj_dir = config_.output_dir / "obj" / target.name;
+        std::error_code ec;
+        fs::create_directories(obj_dir, ec);
+        
+        std::vector<std::string> object_files;
+        
+        // Step 1: Compile each source to object file
+        for (const auto& source : target.sources) {
+            fs::path src_path(source);
+            fs::path obj_path = obj_dir / (src_path.stem().string() + ".o");
+            
+            aria_make::CCompilerInterface::CompileTask task;
+            task.sources = {source};
+            task.output = obj_path.string();
+            task.compile_only = true;
+            task.position_independent = true;  // -fPIC for libraries
+            task.flags = flags;
+            
+            if (config_.verbose) {
+                std::cout << "[C] " << compiler_path << " -c -fPIC";
+                for (const auto& flag : flags) {
+                    std::cout << " " << flag;
+                }
+                std::cout << " -o " << obj_path.string();
+                std::cout << " " << source << "\n";
+            }
+            
+            auto result = compiler.compile(task);
+            
+            if (result.exit_code != 0) {
+                stderr_out = result.stderr_output;
+                return result.exit_code;
+            }
+            
+            object_files.push_back(obj_path.string());
+        }
+        
+        // Step 2: Create static library from objects
+        aria_make::CCompilerInterface::LibraryTask lib_task;
+        lib_task.objects = object_files;
+        lib_task.output = target.output_path.string();
+        
+        if (config_.verbose) {
+            std::cout << "[AR] ar rcs " << target.output_path.string();
+            for (const auto& obj : object_files) {
+                std::cout << " " << obj;
+            }
+            std::cout << "\n";
+        }
+        
+        auto lib_result = compiler.create_static_library(lib_task);
+        
+        stdout_out = lib_result.stdout_output;
+        stderr_out = lib_result.stderr_output;
+        
+        if (config_.verbose && lib_result.exit_code == 0) {
+            std::cout << "[OK] " << target.name << " (C library) built\n";
+        }
+        
+        return lib_result.exit_code;
+        
+    } catch (const std::exception& e) {
+        stderr_out = std::string("C compiler invocation failed: ") + e.what();
+        return -1;
+    }
 }
 
 // =============================================================================

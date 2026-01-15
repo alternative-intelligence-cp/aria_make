@@ -126,6 +126,42 @@ set_target_properties(aria_make_glob PROPERTIES
 )
 
 # -----------------------------------------------------------------------------
+# Library: aria_make_compiler (Compiler Interface component)
+# -----------------------------------------------------------------------------
+add_library(aria_make_compiler STATIC
+    src/core/compiler_interface.cpp
+)
+
+target_include_directories(aria_make_compiler
+    PUBLIC
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+        $<INSTALL_INTERFACE:include>
+)
+
+set_target_properties(aria_make_compiler PROPERTIES
+    VERSION ${PROJECT_VERSION}
+    POSITION_INDEPENDENT_CODE ON
+)
+
+# -----------------------------------------------------------------------------
+# Library: aria_make_c_compiler (C/C++ Compiler Interface component)
+# -----------------------------------------------------------------------------
+add_library(aria_make_c_compiler STATIC
+    src/core/c_compiler_interface.cpp
+)
+
+target_include_directories(aria_make_c_compiler
+    PUBLIC
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+        $<INSTALL_INTERFACE:include>
+)
+
+set_target_properties(aria_make_c_compiler PROPERTIES
+    VERSION ${PROJECT_VERSION}
+    POSITION_INDEPENDENT_CODE ON
+)
+
+# -----------------------------------------------------------------------------
 # Library: aria_make_core (Build Orchestrator component)
 # -----------------------------------------------------------------------------
 add_library(aria_make_core STATIC
@@ -138,7 +174,14 @@ target_include_directories(aria_make_core
         $<INSTALL_INTERFACE:include>
 )
 
-target_link_libraries(aria_make_core PUBLIC aria_make_state aria_make_abc aria_make_glob Threads::Threads)
+target_link_libraries(aria_make_core PUBLIC 
+    aria_make_state 
+    aria_make_abc 
+    aria_make_glob 
+    aria_make_compiler
+    aria_make_c_compiler
+    Threads::Threads
+)
 
 set_target_properties(aria_make_core PROPERTIES
     VERSION ${PROJECT_VERSION}

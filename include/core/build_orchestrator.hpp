@@ -68,8 +68,8 @@ struct BuildConfig {
     // State directory (default: .aria_make)
     fs::path state_dir = ".aria_make";
 
-    // Compiler path
-    std::string compiler = "ariac";
+    // Compiler path (default: search PATH for ariac, or use full path)
+    std::string compiler = "/home/randy/._____RANDY_____/REPOS/aria/build/ariac";
 
     // Global compiler flags
     std::vector<std::string> global_flags;
@@ -94,11 +94,19 @@ struct BuildConfig {
 // =============================================================================
 struct BuildTarget {
     std::string name;
-    std::string type;                      // "binary", "library", "object"
+    std::string type;                      // "binary", "library", "object", "c_library"
     std::vector<std::string> sources;      // Source patterns (globs or files)
     std::vector<std::string> dependencies; // Other targets this depends on
     std::vector<std::string> flags;        // Target-specific flags
     fs::path output_path;                  // Computed output path
+    
+    // Linking support (for FFI and C libraries)
+    std::vector<std::string> link_libraries; // Libraries to link (-l)
+    std::vector<std::string> link_paths;     // Library search paths (-L)
+    
+    // C/C++ compilation support
+    std::string compiler;                  // "gcc", "g++", "clang", "clang++" (for c_library)
+    std::string output;                    // Explicit output filename (overrides computed path)
 };
 
 // =============================================================================
@@ -302,9 +310,23 @@ private:
                       const std::vector<std::string>& flags,
                       std::string& stdout_out,
                       std::string& stderr_out);
+    
+    // Build a C/C++ library (compile C sources + ar archive)
+    int build_c_library(const BuildTarget& target,
+                        const std::vector<std::string>& flags,
+                        std::string& stdout_out,
+                        std::string& stderr_out);
 
     // Build the compile command for a target
     std::vector<std::string> build_command(const BuildTarget& target);
+    
+    // File type detection
+    bool is_c_source(const std::string& path) const;
+    bool is_cpp_source(const std::string& path) const;
+    bool is_aria_source(const std::string& path) const;
+    
+    // Detect appropriate C/C++ compiler for target
+    std::string detect_c_compiler(const BuildTarget& target) const;
 
     // Report progress to callback
     void report_progress(BuildPhase phase, size_t current, size_t total,

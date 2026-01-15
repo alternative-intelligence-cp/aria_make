@@ -1,6 +1,6 @@
 // hello.aria - Simple hello world program
 
-func:main = int8() {
+func:main = int32() {
     // Print hello world
     pass(0);
 };
